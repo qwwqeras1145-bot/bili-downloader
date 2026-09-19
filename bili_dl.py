@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 r"""
 ===============================================================================
  Fairy III 型  ·  B 站视频下载器   命令行版
@@ -49,7 +49,7 @@ except ImportError:
 
 
 APP_NAME = "Fairy III 型 · B 站视频下载器"
-APP_VER = "1.0"
+APP_VER = "1.1"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -171,8 +171,15 @@ def sanitize(name, limit=100):
     要替换的是 Windows 不允许出现在文件名里的九个字符，顺带把换行制表符
     也换掉——B 站有些标题里真的带换行。
     末尾的 strip(".") 是因为 Windows 不允许文件名以点结尾。
+
+    非字符串一律先转成字符串。标题字段偶尔会是数字或 None，
+    直接拿去做正则替换会抛类型错误
     """
-    if not name:
+    if name is None:
+        return "video"
+    if not isinstance(name, str):
+        name = str(name)
+    if not name.strip():
         return "video"
     name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name)
     name = re.sub(r"\s+", " ", name).strip().strip(".")
@@ -1152,9 +1159,12 @@ class Bili:
         if r.get("code") != 0:
             return 80
         accept = (r.get("data") or {}).get("accept_quality") or []
-        # 接口说它是从高到低排的，但这里自己再取一次最大值，不依赖接口顺序
+        # 接口说它是从高到低排的，但这里自己再取一次最大值，不依赖接口顺序。
+        # 要做类型转换是因为接口偶尔返回字符串形式的编号，
+        # 混着非数字元素时直接 max 会抛类型错误
         try:
-            return max(int(x) for x in accept)
+            nums = [int(x) for x in accept]
+            return max(nums) if nums else 80
         except Exception:
             return 80
 
@@ -1242,15 +1252,31 @@ class Bili:
 #  下载
 # ============================================================================
 def http_get_stream(session, url, headers=None, retries=3):
-    """带重试的流式请求"""
+    """
+    带重试的流式请求。
+
+    拿到非 200/206 的响应时要显式关掉它再重试。
+    不关的话这条连接会一直挂在连接池里，重试几次就积几条，
+    下载大文件时连接池被占满，后面的请求会莫名其妙卡住
+    """
     last = None
     for i in range(retries):
+        r = None
         try:
             r = session.get(url, headers=headers, stream=True, timeout=(15, 60))
             if r.status_code in (200, 206):
                 return r
             last = "HTTP %s" % r.status_code
+            try:
+                r.close()
+            except Exception:
+                pass
         except Exception as e:
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
             last = str(e)
         time.sleep(1.5 * (i + 1))
     raise RuntimeError(last or "请求失败")
@@ -1274,6 +1300,12 @@ def download_file(session, url, path, desc, expect_size=0):
       如果带着 Range 却收到 200 而不是 206，说明服务器忽略了范围请求，
       返回的是完整文件。这时候必须把已下的部分丢掉重来，
       否则会把整个文件追加到半截文件后面，得到一个坏文件。
+
+    读流出错必须接住
+      网络抖动、连接被重置、读超时都会在读取过程中抛出来。
+      以前这里没接，异常会一路冒到顶把程序整个带崩 ——
+      下大文件时中途断网是常事，工具不该因此退出。
+      现在接住之后保留 .part，下次运行能接着下。
 
     进度条刷新限流
       每 0.25 秒最多重绘一次。不限流的话每收一个数据块就刷一次屏，
@@ -1328,6 +1360,7 @@ def download_file(session, url, path, desc, expect_size=0):
     got = done
     t0 = time.time()
     last_draw = 0.0
+    read_error = None
     try:
         with open(tmp, "ab") as f:
             for chunk in r.iter_content(chunk_size=256 * 1024):
@@ -1350,10 +1383,22 @@ def download_file(session, url, path, desc, expect_size=0):
                     # 用 \r 回到行首覆盖重绘，不换行
                     sys.stdout.write("\r" + line[:150].ljust(min(150, len(line))))
                     sys.stdout.flush()
+    except Exception as e:
+        # 网络中断、磁盘写满、连接重置都落这里。
+        # 不往外抛，保住已经下到的那部分
+        read_error = e
     finally:
-        r.close()
+        try:
+            r.close()
+        except Exception:
+            pass
     # 用空格盖掉残留的进度条，再回到行首
     sys.stdout.write("\r" + " " * 150 + "\r")
+
+    if read_error is not None:
+        err("%s 下载中断：%s" % (desc, read_error))
+        info("已下载 %s，再次运行会从这里继续。" % fmt_size(got))
+        return False, got
 
     # 长度对不上就判定失败，保留 .part 供下次续传
     if total and got < total:
@@ -1507,8 +1552,15 @@ def parse_link(text):
       不如直接在里面搜一遍，找到什么用什么。
 
     返回 (bvid, aid, page)，三个值里 bvid 和 aid 只会有一个非空。
+
+    传进来不是字符串时先转成字符串。命令行参数理论上都是字符串，
+    但这个函数也可能被当成库调用，收到数字不该直接抛异常
     """
-    text = (text or "").strip().strip('"').strip("'")
+    if text is None:
+        return None, None, 1
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.strip().strip('"').strip("'")
     if not text:
         return None, None, 1
 
@@ -1665,17 +1717,19 @@ def download_one(bili, link, page=None, outdir=None, qn=None, all_parts=False):
         p = pages[idx]
         cid = p.get("cid")          # 取播放地址必须用这个分P自己的 cid
         part = p.get("part") or ""
-        title = data["title"]
+        # 标题缺字段时给个兜底，不然拼文件名会直接崩
+        title = data.get("title") or "video"
         # 多P视频给每个分P单独起名，否则会互相覆盖
         if len(pages) > 1:
             title = "%s [P%d]%s" % (title, idx + 1, (" " + part) if part else "")
 
         print()
         print(C.B + "  " + "─" * 70 + C.R)
-        info("标题   " + data["title"])
+        info("标题   " + data.get("title", ""))
         if len(pages) > 1:
             info("分P    P%d / %d  %s" % (idx + 1, len(pages), part))
-        info("作者   " + data["owner"]["name"])
+        # 用 get 逐层取，接口偶尔少字段，不能让显示信息把程序带崩
+        info("作者   " + ((data.get("owner") or {}).get("name") or "未知"))
         info("时长   " + fmt_dur(p.get("duration") or data.get("duration")))
         real_bvid = data.get("bvid") or bvid or ""
         real_aid = data.get("aid") or aid or ""
@@ -1699,7 +1753,16 @@ def download_one(bili, link, page=None, outdir=None, qn=None, all_parts=False):
 
         # 说明清晰度是怎么定的，以及为什么没能更高。
         # 用户最常问的就是"我登录了怎么还是 1080P"，这里直接答清楚
-        accept = info_play.get("accept") or []
+        #
+        # accept 里的元素统一转成整数再比较。接口偶尔会返回字符串编号，
+        # 或者混进 None，直接 max 会抛类型错误把下载中断
+        accept = []
+        for _x in (info_play.get("accept") or []):
+            try:
+                accept.append(int(_x))
+            except Exception:
+                continue
+
         if qn is None:
             if len(accept) > 1:
                 top = QUALITY_NAME.get(max(accept), str(max(accept)))

@@ -166,9 +166,13 @@ it keeps both files and tells you how to load them in a player.
 ## Tests
 
 ```bash
-python test_bili.py              # offline, no network
+python test_bili.py              # main suite, offline
 python test_bili.py --online     # also verifies the live API
+python test_stability.py         # stability fuzzing, hunts for crashes
+python test_e2e_stability.py     # end-to-end, includes a real resume test
 ```
+
+### Main suite
 
 | Group | Coverage |
 |---|---|
@@ -182,6 +186,22 @@ python test_bili.py --online     # also verifies the live API
 | 8 | Live API verification |
 | 9 | Quality selection — VIP scenarios, silent downgrade, DASH track picking |
 | 10 | Argument precedence and defaults |
+
+### Stability fuzzing
+
+The main suite uses a fair amount of synthetic data, which can hide problems that only
+show up in the real world. This group deliberately avoids mocks:
+
+- Malformed API responses (quality list containing strings and `None`, missing `owner`
+  field, missing title)
+- `ConnectionError` / `ChunkedEncodingError` / `Timeout` thrown mid-download
+- stdin hitting EOF immediately in a non-interactive environment
+- Whether read-only commands have side effects such as creating directories
+- Functions receiving arguments of the wrong type
+
+The end-to-end group **actually performs a download and a resume**: it downloads 400
+bytes and drops the connection, then runs again with `Range: bytes=400-` to fetch only
+the remainder, and finally verifies the resulting file byte-for-byte.
 
 ### How the QR encoder is verified
 
@@ -268,6 +288,23 @@ what tool you use. Normal personal viewing volume is fine.
 ---
 
 ## Changelog
+
+### v1.1
+
+Stability fixes, targeting what actually happens when a download goes wrong.
+
+- **An interrupted download no longer crashes the program.** Network hiccups, reset
+  connections and read timeouts used to propagate all the way to the top and kill the
+  process. They are now caught, the `.part` file is kept, and the next run continues
+  from where it stopped.
+- **Fixed a connection leak.** Responses with a non-200/206 status were never closed,
+  so retries accumulated connections and large downloads could stall.
+- **Malformed API responses no longer crash.** A quality list containing strings or
+  `None`, a missing `owner` field, or a missing title used to raise and abort the
+  download.
+- **`sanitize` and `parse_link` accept non-string input** instead of raising a
+  type error.
+- Added stability fuzzing and end-to-end resume verification.
 
 ### v1.0
 
