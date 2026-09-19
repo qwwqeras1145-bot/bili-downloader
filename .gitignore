@@ -1,0 +1,28 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 测试与运行产物
+*.part
+*.mp4
+*.flv
+BiliVideo/
+
+# 登录凭证，绝不能提交
+.bili_cookies.json
+cookies.json
+*.bili_cookies*
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 系统
+Thumbs.db
+Desktop.ini
+.DS_Store
