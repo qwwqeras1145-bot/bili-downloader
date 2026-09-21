@@ -1,14 +1,28 @@
 # BiliBili Video Downloader
 
-A command-line tool for downloading BiliBili (哔哩哔哩) videos. Paste a link and it downloads.
+Download BiliBili (哔哩哔哩) videos by pasting a link. Ships as both a CLI and a local
+web app, with QR-code login and automatic highest-quality selection.
 
-Supports QR-code login and phone/SMS login.
+**Only needs `requests`. No ffmpeg, no GUI libraries, no Flask.**
 
-**Only needs `requests`. No ffmpeg. No GUI libraries.**
-
-The QR code is drawn directly in your terminal — scan it with your phone to log in.
+The QR code is drawn directly in your terminal or on the web page — scan it with your phone.
 
 [中文文档](README.md) | **English**
+
+---
+
+## Two versions
+
+| Version | Entry point | Best for |
+|---|---|---|
+| CLI | `python bili_dl.py` | Batch downloads, scripting, remote terminals |
+| Web | `python web_app.py` | Wanting a UI, scrubbing the video, not fond of terminals |
+
+The web version opens your browser automatically — paste a link and click.
+
+Both share the same download logic (the web app imports `bili_dl.py`), so a fix in one
+applies to both. The web version is also **dependency-free**: the UI and the HTTP server
+are built on the Python standard library, so no Flask and no frontend framework.
 
 ---
 
@@ -134,6 +148,78 @@ In rare cases the server doesn't demand verification, and SMS login works as-is.
 
 ---
 
+## Web version
+
+```bash
+python web_app.py
+```
+
+Your browser opens at `http://127.0.0.1:8848`. Paste a link, click "解析并下载",
+and once the progress bar finishes you can click the link to save the file.
+
+### What it does
+
+- Parses a pasted link and shows title, uploader, duration and quality
+- The quality dropdown is populated from **what this specific video actually offers**,
+  not a hardcoded list
+- Live progress: percentage, downloaded / total, speed
+- Download history with a save link once finished
+- **Scrubbable playback**: the file server implements HTTP Range requests, so the
+  browser can play and seek directly
+- QR login inside the page, with the QR code drawn on the page itself
+
+### Options
+
+```bash
+python web_app.py --port 9000        # different port, default is 8848
+python web_app.py --out D:\videos    # output directory
+python web_app.py --no-browser       # don't open a browser
+```
+
+If the port is taken it automatically tries the next ones instead of failing.
+
+### Why the web version runs a local server
+
+You might wonder: if there's a web UI, why not just a single HTML file you double-click?
+
+Because a pure frontend approach can't work here, for three reasons:
+
+1. **CORS**
+   BiliBili's playback API does not return CORS headers, so `fetch` from a browser page
+   gets blocked. That's a browser security policy — frontend code can't (and shouldn't)
+   get around it.
+
+2. **Nowhere to keep credentials**
+   The cookies from QR login have to live somewhere. A pure frontend could only use
+   `localStorage`, which travels with the page and is unsafe if you share it or switch
+   machines.
+
+3. **Large downloads are unreliable**
+   A browser download of a few hundred MB can't be resumed if it drops, and there's no
+   stable local path.
+
+So a small local server does the work: requests come from the server (no CORS),
+credentials live in the user directory (the same file the CLI uses), and downloads
+support resume. The browser only displays and triggers.
+
+### Security
+
+- **Listens on `127.0.0.1` only.** Not reachable from the network unless you explicitly
+  pass `--host 0.0.0.0`, which prints a warning at startup
+- **Cross-site requests are rejected**: `Origin` is checked, non-local origins get 403
+- **No arbitrary file read**: the file endpoint takes only a job ID; the path comes from
+  the server's own job table, so a path supplied by the client is useless
+- The output directory is fixed at startup and can't be changed through the API
+
+### Web version limitations
+
+- **DASH-only videos are not supported.** Those need ffmpeg to merge the tracks; faking
+  it in the browser would produce a broken file, so it tells you to use the CLI instead
+- **Multi-part videos download only part 1** (or the `?p=` in the URL). Use the CLI with
+  `--all` to grab every part
+
+---
+
 ## Why no ffmpeg is needed
 
 BiliBili serves two kinds of playback URLs:
@@ -166,13 +252,16 @@ it keeps both files and tells you how to load them in a player.
 ## Tests
 
 ```bash
-python test_bili.py              # main suite, offline
+python test_bili.py              # CLI main suite, offline
 python test_bili.py --online     # also verifies the live API
 python test_stability.py         # stability fuzzing, hunts for crashes
 python test_e2e_stability.py     # end-to-end, includes a real resume test
+python test_web.py               # web version API tests, offline
+python test_web.py --online      # web version, live end-to-end
+python test_web_browser.py       # drives a real browser through the UI
 ```
 
-### Main suite
+### CLI
 
 | Group | Coverage |
 |---|---|
@@ -186,6 +275,34 @@ python test_e2e_stability.py     # end-to-end, includes a real resume test
 | 8 | Live API verification |
 | 9 | Quality selection — VIP scenarios, silent downgrade, DASH track picking |
 | 10 | Argument precedence and defaults |
+
+### Web version
+
+| Group | Coverage |
+|---|---|
+| 1 | Page rendering, including placeholder substitution and "no external resources" |
+| 2 | Job API — missing jobs, oversized IDs, percent-encoded parameters |
+| 3 | File serving and Range: full, middle, suffix, open-ended, out-of-range 416, invalid Range |
+| 4 | Security: path traversal, cross-site requests, oversized bodies, invalid links |
+| 5 | Concurrency: 8 parallel downloads plus multi-threaded status polling |
+| 6 | Job management: ID generation, progress math, divide-by-zero, job cap |
+| 7 | Helpers and byte counting |
+| 8 | CLI entry, including automatic port fallback |
+
+The file-serving group **injects a fake job**, so it runs fully offline and is repeatable
+regardless of how BiliBili's API behaves that day.
+
+### Browser end-to-end
+
+`test_web_browser.py` launches a real headless Edge and drives the page over CDP:
+types a link, clicks the button, waits for the download, reads the on-screen text.
+It covers what API tests cannot — whether the click handler is actually bound, whether
+the progress bar moves, whether the save link appears.
+
+```bash
+python -m pip install websockets     # only needed for this test
+python test_web_browser.py
+```
 
 ### Stability fuzzing
 
@@ -230,6 +347,10 @@ Only a code that an independent decoder can actually read is considered correct.
   not a bug.
 - **Not every video can be downloaded.** Creator-disabled downloads, private videos
   and region restrictions will all fail.
+- **The web version does not support DASH-only videos** — those need ffmpeg, so it
+  points you at the CLI.
+- **The web version downloads only part 1 of multi-part videos.** Use the CLI with
+  `--all` for every part.
 - The tool uses BiliBili's public web endpoints. If those change, the tool will need
   updating.
 
@@ -288,6 +409,27 @@ what tool you use. Normal personal viewing volume is fine.
 ---
 
 ## Changelog
+
+### v1.2
+
+Added the web version.
+
+- **New `web_app.py`**: a small local server; open your browser, paste a link, download
+- The UI is dependency-free — no Flask, no frontend framework, still only `requests`
+- QR login inside the page, with the code drawn on the page
+- The quality dropdown is filled from what the video actually offers
+- The file server supports Range requests, so you can scrub the video in the browser
+- Added `test_web.py` (74 offline + live end-to-end) and `test_web_browser.py`
+  (drives a real browser through the UI, 19 checks)
+
+Two bugs fixed:
+
+- **An out-of-range Range request used to hang the client forever.** The 416 response
+  omitted `Content-Length`, so on an HTTP/1.1 keep-alive connection the client waited
+  for a body that never came. Measured: from "hangs" to 0.01s.
+- **Oversized request bodies corrupted the keep-alive connection.** The unread tail was
+  left in the socket and parsed as the start of the next request. Now the body is always
+  drained and the request is rejected with 413.
 
 ### v1.1
 
