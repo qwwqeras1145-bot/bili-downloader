@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -10,6 +10,12 @@ env/
 *.part
 *.mp4
 *.flv
+*.m4a
+*.mp3
+*.srt
+*.ass
+*.info.json
+*.cover.jpg
 BiliVideo/
 
 # 登录凭证，绝不能提交

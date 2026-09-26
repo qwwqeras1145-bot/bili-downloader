@@ -154,6 +154,16 @@ def main():
                 break
         time.sleep(2)
 
+        # 装上错误收集器。必须赶在下面这些点击之前装，
+        # 否则"页面没有 JS 报错"这句其实什么都没验证
+        cdp.js(
+            "window.__errs=[];"
+            "window.addEventListener('error',function(e){"
+            "window.__errs.push('error: '+(e.message||'')+' @'+(e.filename||'')+':'+(e.lineno||0))});"
+            "window.addEventListener('unhandledrejection',function(e){"
+            "window.__errs.push('reject: '+String(e.reason))});"
+            "'installed'")
+
         print()
         print("一、页面加载与元素就位")
         print("=" * 72)
@@ -183,11 +193,19 @@ def main():
         check(val == "BV17x411w7KC", "链接已填入输入框", str(val))
 
         cdp.js("document.getElementById('go').click()")
-        time.sleep(1.5)
 
-        # 按钮应立刻被禁用，防止重复提交
-        check(cdp.js("document.getElementById('go').disabled") is True,
-              "点击后按钮立即禁用（防重复提交）")
+        # 按钮应立刻被禁用，防止重复提交。
+        #
+        # 这里不能用"睡 1.5 秒再看一眼"的写法：如果下载目录里已经有
+        # 上一次留下的成品，整个流程可能一秒内就跑完，按钮已经恢复了，
+        # 于是明明正确也会报失败。改成在短窗口内轮询"有没有被禁用过"
+        ever_disabled = False
+        for _ in range(20):
+            time.sleep(0.05)
+            if cdp.js("document.getElementById('go').disabled") is True:
+                ever_disabled = True
+                break
+        check(ever_disabled, "点击后按钮立即禁用（防重复提交）")
 
         msg = cdp.js("document.getElementById('msg').textContent") or ""
         check(bool(msg.strip()), "界面给出了状态提示: %s" % msg.strip()[:40])
@@ -250,8 +268,6 @@ def main():
         print()
         print("五、检查页面是否有 JS 报错")
         print("=" * 72)
-        errs = cdp.js("(function(){try{return window.__errs?window.__errs.length:0}"
-                      "catch(e){return -1}})()")
         # 用 Performance 里的资源条目确认外部资源都是本机
         ext = cdp.js(
             "(function(){var a=performance.getEntriesByType('resource')"
@@ -259,6 +275,105 @@ def main():
             " && r.name.indexOf('http://localhost')!==0});"
             "return a.map(function(r){return r.name}).slice(0,5)})()")
         check(not ext, "页面没有加载任何外部资源（离线可用）", str(ext))
+
+        print()
+        print("六、收藏夹：载入、勾选、批量下载")
+        print("=" * 72)
+        check(cdp.js("!!document.getElementById('folder')"), "收藏夹下拉框存在")
+        check(cdp.js("!!document.getElementById('favlist')"), "视频列表容器存在")
+
+        # 附加选项应能被 JS 读到。这组开关是网页版和命令行版共用的
+        opts = cdp.js("JSON.stringify(getOpts())")
+        check(isinstance(opts, str) and "template" in opts,
+              "getOpts() 能读出一组附加选项: %s" % (opts or "")[:60])
+
+        # 点「载入收藏夹」，走的是用户真实路径
+        cdp.js("document.getElementById('fload').click()")
+        n = 0
+        for _ in range(40):
+            time.sleep(0.5)
+            n = cdp.js("document.getElementById('folder').options.length") or 0
+            # 注意是 >1：下拉框里本来就有 1 个占位项，
+            # 用 >0 判断会在请求还没回来时就跳出循环
+            if n > 1:
+                break
+        check(n > 1, "收藏夹下拉框已填充 %s 个收藏夹" % n,
+              cdp.js("document.getElementById('favstate').textContent"))
+
+        if n > 1:
+            # 挑视频数最少的那个，别让测试去拉几千条
+            idx = cdp.js(
+                "(function(){var s=document.getElementById('folder');"
+                "var best=0,bn=1e9;"
+                "for(var i=0;i<s.options.length;i++){"
+                "var m=/（(\\d+) 个）/.exec(s.options[i].textContent);"
+                "var v=m?parseInt(m[1],10):1e9;"
+                "if(v<bn){bn=v;best=i}}"
+                "s.selectedIndex=best;"
+                "return s.options[best].textContent})()")
+            print("      选中: %s" % idx)
+
+            cdp.js("document.getElementById('folder').onchange()")
+            cnt = 0
+            for _ in range(60):
+                time.sleep(0.5)
+                cnt = cdp.js("document.querySelectorAll('#favlist .fav').length") or 0
+                if cnt > 0:
+                    break
+            check(cnt > 0, "视频列表已渲染 %s 行" % cnt)
+
+            if cnt > 0:
+                rows = cdp.js(
+                    "Array.prototype.map.call(document.querySelectorAll('#favlist .fav'),"
+                    "function(r){return r.dataset.i}).join(',')")
+                check(bool(rows), "每行都带下标: %s" % (rows or "")[:40])
+
+                # 单行「下载」按钮必须先于全选验证，否则选中状态会干扰判断
+                check(cdp.js("!!document.querySelector('#favlist .fav .dl')"),
+                      "每行都有单独下载按钮")
+
+                # 全选 -> 按钮文字应带上数量
+                cdp.js("document.getElementById('fall').click()")
+                txt = cdp.js("document.getElementById('fdl').textContent") or ""
+                picked = cdp.js("document.querySelectorAll('#favlist .ck:checked').length")
+                check(picked == cnt, "全选后勾选了 %s / %s 行" % (picked, cnt))
+                check(("（%d）" % cnt) in txt, "按钮上显示了选中数量: %s" % txt)
+
+                # 清空 -> 再点批量下载应给出提示而不是提交
+                cdp.js("document.getElementById('fnone').click()")
+                check(cdp.js("document.querySelectorAll('#favlist .ck:checked').length") == 0,
+                      "清空后没有勾选")
+                cdp.js("document.getElementById('fdl').click()")
+                time.sleep(0.6)
+                m2 = cdp.js("document.getElementById('msg').textContent") or ""
+                check("勾选" in m2 or "选中" in m2,
+                      "一个都没选时给出提示: %s" % m2.strip()[:30])
+
+                # 反选 -> 应重新全勾上
+                cdp.js("document.getElementById('finv').click()")
+                check(cdp.js("document.querySelectorAll('#favlist .ck:checked').length") == cnt,
+                      "反选后勾选数回到 %s" % cnt)
+
+                # 真的走一次批量下载，选一个小收藏夹不该太久
+                cdp.js("document.getElementById('fdl').click()")
+                bt = ""
+                for _ in range(90):
+                    time.sleep(1)
+                    bt = cdp.js("document.getElementById('btbox').textContent") or ""
+                    if "全部结束" in bt:
+                        break
+                check("全部结束" in bt, "批量进度面板跑到结束")
+                if bt:
+                    print("      批量面板: %s" % " ".join(bt.split())[:110])
+                check(cdp.js("!!document.querySelector('#btbox .bar')"), "批量面板有进度条")
+                check(cdp.js("document.querySelectorAll('#btbox .it').length") == cnt,
+                      "批量面板列出的条数与选中数一致")
+
+        print()
+        print("七、页面无 JS 报错")
+        print("=" * 72)
+        errs = cdp.js("JSON.stringify(window.__errs||[])") or "[]"
+        check(errs == "[]", "整个流程没有 JS 报错或未处理的 Promise 拒绝", errs[:200])
 
         cdp.close()
 

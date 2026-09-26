@@ -1,4 +1,4 @@
-﻿# 仅测试需要，主程序只要 requests
+# 仅测试需要，主程序只要 requests
 
 # test_qr.py 用它做二维码的独立解码验证
 opencv-python-headless>=4.5.0
@@ -6,3 +6,6 @@ numpy>=1.20.0
 
 # test_web_browser.py 用它通过 CDP 驱动浏览器
 websockets>=10.0
+
+# 其余测试（test_bili / test_fav / test_web / test_shutdown /
+# test_stability / test_e2e_stability）只用标准库，不需要额外安装

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 r"""
 ===============================================================================
  Fairy III 型  ·  B 站视频下载器   命令行版
@@ -8,14 +8,38 @@ r"""
    python bili_dl.py                    交互模式，粘贴链接即可
    python bili_dl.py <链接>              直接下载
    python bili_dl.py <链接> -p 3         下载第 3 个分P
+   python bili_dl.py <链接> --all        下载全部分P
+   python bili_dl.py <链接> -q 120       指定清晰度（120 是 4K）
+   python bili_dl.py --fav               浏览并下载收藏夹（批量或单个）
+
+ 附加内容（可单独开，也可用 --all-extras 一次全开）
+   --subtitle        下字幕，存成 SRT
+   --danmaku         下弹幕，同时转一份 ASS
+   --cover           下封面图
+   --metadata        存一份视频信息 JSON
+   --all-extras      上面四样全开
+
+ 只要音频
+   --audio-only      只下音频，存成 m4a
+   --mp3             顺带转成 mp3（需要 ffmpeg）
+
+ 命名与配置
+   -t, --template    命名模板，例如 "{up}/{date} {title}"
+   --show-config     看当前配置与模板可用字段
+   --set key=value   改配置，例如 --set template="{up}/{title}"
+
+ 登录
    python bili_dl.py --login             扫码登录
    python bili_dl.py --login-sms         手机号短信登录
    python bili_dl.py --whoami            查看当前登录状态
    python bili_dl.py --logout            退出登录
 
  依赖
-   仅需 requests 一个库。二维码在终端内直接绘制，不需要任何额外依赖，
-   也不需要安装 ffmpeg（默认走 B 站已合并的 MP4 流）。
+   仅需 requests 一个库。二维码在终端内直接绘制，不需要任何额外依赖。
+   默认走 B 站已合并的 MP4 流，所以下载视频不需要 ffmpeg。
+   只有两种情况会用到 ffmpeg（没装也能用，只是结果不同）：
+     --mp3        转 mp3 格式
+     极少数只有 DASH 分轨的视频，需要合并音视频
 
 ===============================================================================
  使用须知   请先读完再用
@@ -27,8 +51,8 @@ r"""
  4. 请勿高频批量抓取，那会给对方服务器造成负担，也可能导致你的账号被限制。
  5. 下载他人作品后，版权仍归原作者所有。
 
- 登录只是为了取到更高清晰度。登录凭证只保存在本机当前用户目录下的
- .bili_cookies.json，不会上传到任何地方。
+ 登录只是为了取到更高清晰度、字幕和收藏夹。登录凭证只保存在本机当前用户
+ 目录下的 .bili_cookies.json，不会上传到任何地方。
 
 ===============================================================================
 """
@@ -49,12 +73,13 @@ except ImportError:
 
 
 APP_NAME = "Fairy III 型 · B 站视频下载器"
-APP_VER = "1.1"
+APP_VER = "1.3"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 COOKIE_FILE = os.path.join(os.path.expanduser("~"), ".bili_cookies.json")
+CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".bili_dl.json")
 DEFAULT_OUTDIR = os.path.join(os.path.expanduser("~"), "Downloads", "BiliVideo")
 
 # 用到的接口。全部是 B 站网页端自己在用的公开接口，没有逆向私有协议
@@ -66,12 +91,44 @@ API_QR_POLL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
 API_SMS_SEND = "https://passport.bilibili.com/x/passport-login/web/sms/send"
 API_SMS_LOGIN = "https://passport.bilibili.com/x/passport-login/web/login/sms"
 
+# 字幕与弹幕。字幕接口对未登录用户不返回内容，所以这两个功能都要登录
+API_PLAYER_V2 = "https://api.bilibili.com/x/player/v2"
+API_DANMAKU = "https://api.bilibili.com/x/v1/dm/list.so"
+
+# 收藏夹相关
+API_FAV_FOLDERS = "https://api.bilibili.com/x/v3/fav/folder/created/list-all"
+API_FAV_LIST = "https://api.bilibili.com/x/v3/fav/resource/list"
+
+
+# ============================================================================
+#  防止模块被加载两次
+#
+#  python bili_dl.py 会把本文件加载成 __main__，
+#  而 bili_fav.py 里的 import bili_dl 又会把同一个文件当作独立模块加载一遍。
+#  结果是内存里有两份模块对象，各有各的模块级变量。
+#
+#  这个坑踩过一次：-y 开关的作用是修改模块级的 _ASSUME_YES，
+#  在 __main__ 里改了，bili_fav 调用的 confirm() 读的却是另一份，
+#  开关形同虚设，批量下载在非交互环境下照样卡在确认那一步。
+#
+#  这里提前把 "bili_dl" 这个名字注册成当前模块对象，
+#  后面谁再 import 都会拿到同一份，变量自然就通了。
+# ============================================================================
+if __name__ == "__main__":
+    sys.modules.setdefault("bili_dl", sys.modules["__main__"])
+
+
 # qn 参数与画质的对应关系。接口返回的 quality 字段就是这里的键
 QUALITY_NAME = {
     127: "8K 超高清", 126: "杜比视界", 125: "HDR 真彩",
     120: "4K 超清", 116: "1080P60", 112: "1080P 高码率",
     100: "智能修复", 80: "1080P 高清", 74: "720P60",
     64: "720P 高清", 32: "480P 清晰", 16: "360P 流畅", 6: "240P 极速",
+}
+
+# 音频码率的档位名称。id 与画质编号共用一个命名空间，这里单独一张表
+AUDIO_QUALITY_NAME = {
+    30216: "64K", 30232: "132K", 30280: "192K", 30250: "杜比全景声", 30251: "Hi-Res 无损",
 }
 
 # 扫码轮询接口返回的子状态码。外层 code 一直是 0，真正表示进度的是 data.code
@@ -83,6 +140,190 @@ QR_POLL_OK = 0
 QR_POLL_EXPIRED = 86038
 QR_POLL_WAIT = 86101
 QR_POLL_SCANNED = 86090
+
+
+# ============================================================================
+#  配置文件
+#
+#  以前所有设置都得写在命令行参数里，批量下载时那串参数又长又难记。
+#  这里给一个 JSON 配置文件，命令行参数优先级更高，没给就用配置里的。
+# ============================================================================
+DEFAULT_CONFIG = {
+    # 下载目录。None 表示用 DEFAULT_OUTDIR
+    "outdir": None,
+    # 默认清晰度编号。None 表示自动取账号可用的最高档
+    "quality": None,
+    # 命名模板，见 build_relpath 的说明
+    "template": "{title}",
+    # 批量下载的并发数
+    "concurrency": 3,
+    # 这些是"顺手带上"的附加内容，默认都关，需要时开
+    "subtitle": False,
+    "danmaku": False,
+    "cover": False,
+    "metadata": False,
+    # 只下音频
+    "audio_only": False,
+    # 多分P 视频是否每个分P 都下。默认只下第 1 个分P
+    "all_parts": False,
+    # 代理，形如 http://127.0.0.1:7890
+    "proxy": None,
+    # 批量下载时单个视频之间的间隔秒数，避免请求太密
+    "interval": 1.0,
+}
+
+
+def load_config():
+    """
+    读配置文件，缺失的键用默认值补齐。
+
+    配置文件损坏或格式不对时不报错，直接用默认值 ——
+    配置坏掉不该让工具完全不能用，顶多是设置没生效
+    """
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                user = json.load(f)
+            if isinstance(user, dict):
+                for k, v in user.items():
+                    if k in cfg:
+                        cfg[k] = v
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    """写配置文件。失败时返回 False 而不是抛异常"""
+    try:
+        data = {k: cfg.get(k, v) for k, v in DEFAULT_CONFIG.items()}
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        err("保存配置失败：%s" % e)
+        return False
+
+
+def coerce_config_value(key, raw):
+    """
+    把命令行传来的字符串转成配置项应有的类型。
+
+    类型按默认值的类型判断。布尔项接受 1/0/true/false/on/off/yes/no，
+    这样用户在命令行里不用纠结写法
+    """
+    default = DEFAULT_CONFIG.get(key)
+    if isinstance(default, bool):
+        s = str(raw).strip().lower()
+        if s in ("1", "true", "on", "yes", "y", "是"):
+            return True
+        if s in ("0", "false", "off", "no", "n", "否"):
+            return False
+        raise ValueError("布尔项请用 true/false")
+    if isinstance(default, int):
+        return int(raw)
+    if isinstance(default, float):
+        return float(raw)
+    if default is None:
+        # outdir / quality / proxy 这类默认是 None，按内容猜
+        s = str(raw).strip()
+        if s.lower() in ("", "none", "null", "auto"):
+            return None
+        if s.isdigit():
+            return int(s)
+        return s
+    return str(raw)
+
+
+# ============================================================================
+#  命名模板
+#
+#  默认只按标题命名，批量下载时几十个文件全堆在一个目录里没法看。
+#  模板里可以用斜杠分目录，例如 {up}/{date} {title}。
+#  分目录的处理要点：整串直接做文件名清理会把斜杠也替换掉，
+#  所以必须按分隔符拆开，逐段清理再拼回去。
+# ============================================================================
+TEMPLATE_FIELDS = {
+    "title": "视频标题",
+    "bvid": "BV 号",
+    "aid": "av 号",
+    "up": "UP 主名字",
+    "date": "发布日期，形如 2026-09-21",
+    "p": "分P 序号，单P 时为空",
+    "part": "分P 名称，单P 时为空",
+    "quality": "清晰度名称",
+    "duration": "时长，形如 05-32",
+}
+
+
+def build_relpath(template, ctx, fallback="video"):
+    """
+    按模板算出相对路径，返回一个用系统分隔符拼好的路径字符串。
+
+    这里的处理顺序很关键，踩过坑
+      必须「先按模板拆目录，再往每段里填字段值」，
+      不能「先填字段值，再按分隔符拆」。
+
+    起因是遇到了一个标题里带斜杠的视频：
+      【终末地】基建作业……（包含前期/中期）
+    如果先填值再拆分，标题里的那个斜杠会被当成目录分隔符，
+    凭空多出一层目录，文件被塞到 前期/中期）这种莫名其妙的位置。
+    先拆模板就没有这个问题 —— 模板里的斜杠是用户写的，是目录；
+    字段值里的斜杠是数据，会被 sanitize 换成下划线。
+    """
+    tpl = template or "{title}"
+    # 模板里的反斜杠按目录分隔符处理，兼容 Windows 写法
+    tpl = tpl.replace("\\", "/")
+
+    parts = []
+    for seg in tpl.split("/"):
+        seg = seg.strip()
+        if not seg:
+            continue
+        # 先填字段
+        for key in TEMPLATE_FIELDS:
+            val = ctx.get(key, "")
+            seg = seg.replace("{%s}" % key, str(val) if val is not None else "")
+        # 去掉没被替换掉的未知字段，免得留在文件名里
+        seg = re.sub(r"\{[^}]*\}", "", seg)
+        # 再清理。这一步会把字段值里自带的斜杠也换成下划线
+        seg = sanitize(seg, limit=80)
+        if seg:
+            parts.append(seg)
+
+    if not parts:
+        return sanitize(fallback)
+
+    out = os.path.join(*parts) if len(parts) > 1 else parts[0]
+    return out if out.strip() else sanitize(fallback)
+
+
+def template_context(vinfo, page=None, part="", p_index=0, quality=""):
+    """把视频信息整理成模板可用的字段"""
+    owner = (vinfo.get("owner") or {}).get("name") or ""
+    ts = vinfo.get("pubdate") or vinfo.get("ctime") or 0
+    try:
+        date_s = time.strftime("%Y-%m-%d", time.localtime(int(ts))) if ts else ""
+    except Exception:
+        date_s = ""
+    dur = (page or {}).get("duration") or vinfo.get("duration") or 0
+    try:
+        dur_s = "%02d-%02d" % (int(dur) // 60, int(dur) % 60)
+    except Exception:
+        dur_s = ""
+    return {
+        "title": vinfo.get("title") or "",
+        "bvid": vinfo.get("bvid") or "",
+        "aid": vinfo.get("aid") or "",
+        "up": owner,
+        "date": date_s,
+        "p": ("P%d" % p_index) if p_index else "",
+        "part": part or "",
+        "quality": quality or "",
+        "duration": dur_s,
+    }
+
 
 
 # ============================================================================
@@ -109,28 +350,140 @@ class C:
 # 下面五个是输出函数。都带 flush，因为进度和二维码必须在终端里立刻出现，
 # 不能攒在缓冲区里等着一起吐。用 pythonw 或重定向时这个差别很明显
 def info(msg):
-    """普通信息"""
+    """
+    普通信息。
+
+    静默模式下不输出。批量下载时几十个线程同时刷这些行，
+    终端会被冲得什么都看不见，而网页版本来就有自己的进度显示
+    """
+    if _QUIET:
+        return
     print("  " + msg, flush=True)
 
 
 def ok(msg):
-    """成功"""
+    """成功。静默模式下不输出，理由同 info"""
+    if _QUIET:
+        return
     print(C.GRN + "  [完成] " + msg + C.R, flush=True)
 
 
 def warn(msg):
-    """警告，不致命但需要留意"""
+    """
+    警告，不致命但需要留意。
+
+    静默模式下仍然输出 —— 这些行说的是"哪里不太对"，
+    正是批量下载跑完之后需要回头看的东西
+    """
     print(C.YEL + "  [注意] " + msg + C.R, flush=True)
 
 
 def err(msg):
-    """错误"""
+    """错误。任何模式下都输出"""
     print(C.RED + "  [错误] " + msg + C.R, flush=True)
 
 
 def step(msg):
-    """当前正在做什么"""
+    """当前正在做什么。静默模式下不输出，理由同 info"""
+    if _QUIET:
+        return
     print(C.BLU + "  ▶ " + msg + C.R, flush=True)
+
+
+# ============================================================================
+#  安全输入
+#
+#  裸调 input() 在非交互环境里会出问题：管道、计划任务、重定向到文件时
+#  stdin 立刻 EOF，抛 EOFError 把程序顶掉；有些环境下它不抛异常却一直不返回，
+#  表现为永久挂住 —— 比报错更难受，因为看不出卡在哪。
+#  所有需要人工输入的地方统一走这里。
+# ============================================================================
+_ASSUME_YES = False
+# 当前有没有人坐在终端前等回答。默认按"有"处理，
+# 因为直接当脚本跑是最常见的用法。各入口自己声明真实情况。
+_INTERACTIVE = True
+# 静默开关。定义在这里而不是跟 set_quiet 放一起，是因为
+# info/ok/step 几个输出函数要用它，得先有这个名字。
+# 并发批量下载时必须打开：多个线程同时往终端写 \r 进度条会糊成一团。
+# 打开之后进度条、info、step、ok 都不输出，warn 和 err 照常输出。
+_QUIET = False
+
+
+def set_interactive(on):
+    """
+    声明现在能不能问用户问题。
+
+    为什么不直接用 sys.stdin.isatty()：那是进程级的，而"要不要问"
+    是调用级的。网页版在终端里启动时 isatty() 是真，但下载发生在
+    后台线程 —— 那里调 input() 没人回答，线程就永远停在那儿，
+    网页上表现为进度条一直 0%，也不报错，极难排查。
+    所以必须由入口显式声明，不能靠 isatty() 猜。
+    """
+    global _INTERACTIVE
+    _INTERACTIVE = bool(on)
+    return _INTERACTIVE
+
+
+def is_interactive():
+    return _INTERACTIVE
+
+
+def set_assume_yes(on):
+    """
+    打开之后所有确认提示都自动通过。
+
+    给脚本和批量任务用。不加这个开关，非交互环境下批量下载
+    会卡在"确认开始？"那一步不动。
+    """
+    global _ASSUME_YES
+    _ASSUME_YES = bool(on)
+    return _ASSUME_YES
+
+
+def assume_yes():
+    return _ASSUME_YES
+
+
+def safe_input(prompt, default=""):
+    """
+    读一行输入，读不到就返回默认值。
+
+    先在 set_interactive(False) 时直接返回默认值 —— 后台线程里
+    根本没有"用户"这个概念，问也问不出结果。
+
+    再判断 stdin 可用性。光接住异常不够 ——
+    有些环境下 input() 不抛异常，就是不返回。
+    """
+    if not _INTERACTIVE:
+        print(prompt + "（后台运行，取默认值）", flush=True)
+        return default
+    try:
+        if sys.stdin is None or getattr(sys.stdin, "closed", False):
+            print(prompt + "（无输入源，用默认值）")
+            return default
+    except Exception:
+        return default
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+
+
+def confirm(prompt, default=False):
+    """
+    是/否确认。返回 True 表示继续。
+
+    --yes 打开时直接通过，并说明一句，
+    免得用户以为确认步骤被静默跳过了。
+    """
+    if _ASSUME_YES:
+        info("已按 --yes 自动确认")
+        return True
+    ans = safe_input(prompt, default="").strip().lower()
+    if not ans:
+        return default
+    return ans in ("y", "yes", "是")
 
 
 def fmt_size(n):
@@ -1018,8 +1371,8 @@ class Bili:
         warn("B 站登录接口需要人机验证，本工具不会绕过。")
         info("建议优先使用 --login 扫码登录，更简单也更安全。")
         print()
-        cid = input("  国家代码（中国大陆直接回车，默认 86）：").strip() or "86"
-        tel = input("  手机号：").strip()
+        cid = safe_input("  国家代码（中国大陆直接回车，默认 86）：").strip() or "86"
+        tel = safe_input("  手机号：").strip()
         if not re.match(r"^\d{6,15}$", tel):
             err("手机号格式不对")
             return False
@@ -1062,7 +1415,7 @@ class Bili:
             info("请改用扫码登录： python %s --login" % os.path.basename(__file__))
             return False
 
-        sms = input("  短信验证码：").strip()
+        sms = safe_input("  短信验证码：").strip()
         if not sms:
             err("未输入验证码")
             return False
@@ -1096,9 +1449,9 @@ class Bili:
         print()
         info("从浏览器开发者工具里复制 Cookie 值。三个都要，缺一不可。")
         print()
-        sess = input("  SESSDATA        ：").strip()
-        jct = input("  bili_jct        ：").strip()
-        uid = input("  DedeUserID      ：").strip()
+        sess = safe_input("  SESSDATA        ：").strip()
+        jct = safe_input("  bili_jct        ：").strip()
+        uid = safe_input("  DedeUserID      ：").strip()
         if not (sess and jct and uid):
             err("三项都必须填写")
             return False
@@ -1248,6 +1601,318 @@ class Bili:
             "length": 0,
             "backup": [],
         }, None
+
+    # ---- 字幕 ----
+    def subtitles(self, bvid, cid, aid=None, retries=5):
+        """
+        取这个视频的字幕列表，返回 (列表, 错误)。
+
+        两个实测出来的坑，都写在注释里免得以后忘记
+
+        坑一：aid 明显提高成功率
+          只传 bvid 和 cid 时，接口常返回一串官方字幕但每条 is_lock=true、
+          地址为空，拿不到内容。带上 aid 之后拿到带地址字幕的概率高得多。
+          但这不是绝对的 —— 不带 aid 偶尔也能拿到，所以 aid 属于"该带"， 
+          而不是"不带就一定失败"。
+
+        坑二：地址本身就是间歇性出现的
+          同一个视频连续请求十次，大约八次能拿到地址，两次一条都没有。
+          而且有时返回 12 条官方字幕且全部带地址，有时只有 1 条 AI 字幕。
+          这是服务端多节点缓存不一致导致的，不是请求写错了。
+          所以这里内建重试：拿不到可用地址就再试几次。
+          实测加了这个重试之后，连续五轮都成功，而单次请求只有八成把握。
+          不重试的话，用户会以为"这视频没字幕"。
+
+        列表里每项形如 {'lan': 'zh-CN', 'lan_doc': '中文', 'url': '...'}。
+        """
+        params = {"bvid": bvid, "cid": cid}
+        if aid:
+            params["aid"] = aid
+
+        last_err = ""
+        best = []
+        for attempt in range(max(1, retries)):
+            try:
+                r = self.s.get(API_PLAYER_V2, params=params, timeout=20).json()
+            except Exception as e:
+                last_err = "网络异常：%s" % e
+                time.sleep(0.8)
+                continue
+
+            if r.get("code") != 0:
+                last_err = r.get("message") or ("返回码 %s" % r.get("code"))
+                # 接口明确报错就别重试了，重试也不会变
+                return [], last_err
+
+            raw = ((r.get("data") or {}).get("subtitle") or {}).get("subtitles") or []
+            usable = []
+            for item in raw:
+                url = item.get("subtitle_url") or ""
+                if url.startswith("//"):
+                    url = "https:" + url
+                if not url:
+                    continue
+                usable.append({
+                    "lan": item.get("lan") or "",
+                    "lan_doc": item.get("lan_doc") or item.get("lan") or "字幕",
+                    "url": url,
+                    "ai": (item.get("lan") or "").startswith("ai-"),
+                })
+
+            if usable:
+                return usable, ""
+
+            # 记下见过的最多条目数，用于给用户一个像样的解释
+            if len(raw) > len(best):
+                best = raw
+            if attempt < retries - 1:
+                time.sleep(1.0 + attempt * 0.5)
+
+        # 全部重试完还是没地址
+        if best:
+            return [], ("接口没有给出可下载的字幕地址（共 %d 条字幕，全部未开放）。"
+                        "换个时间再试可能就有了" % len(best))
+        return [], last_err or "该视频没有字幕"
+
+    def fetch_subtitle(self, url):
+        """取字幕正文，返回 (解析后的字典, 错误)"""
+        try:
+            r = self.s.get(url, timeout=25)
+            data = json.loads(r.content.decode("utf-8"))
+        except Exception as e:
+            return None, "字幕下载失败：%s" % e
+        if not isinstance(data, dict):
+            return None, "字幕格式不认识"
+        return data, ""
+
+    # ---- 弹幕 ----
+    def danmaku(self, cid):
+        """
+        取弹幕 XML，返回 (文本, 错误)。
+
+        这里必须用 content 再按 UTF-8 解，不能用 r.text。
+        接口的 Content-Type 是 text/xml，不带 charset，
+        requests 遇到这种情况默认按 ISO-8859-1 解码，
+        结果就是满屏乱码。这个坑实测踩过。
+        """
+        try:
+            r = self.s.get(API_DANMAKU, params={"oid": cid}, timeout=25)
+        except Exception as e:
+            return "", "网络异常：%s" % e
+        if r.status_code not in (200, 206):
+            return "", "HTTP %s" % r.status_code
+        try:
+            return r.content.decode("utf-8", "replace"), ""
+        except Exception as e:
+            return "", "弹幕解码失败：%s" % e
+
+    # ---- 音频轨（仅音频下载用）----
+    def audio_tracks(self, bvid, cid):
+        """
+        取音频轨列表，返回 (列表, 错误)。
+
+        要走 DASH 分支，而这里有个容易踩的点：
+        **不能带 platform=html5 这个参数**。带上它，接口会强制返回已合并的
+        durl 流，dash 字段整个消失，音频轨自然是空的。
+        主下载流程（playurl）反而正是靠这个参数拿到合并流的，
+        两个接口用法刚好相反，实测比对过才确认。
+
+        每项包含 url、bandwidth、id。
+        """
+        params = {"bvid": bvid, "cid": cid, "fnval": 4048,
+                  "fnver": 0, "fourk": 1}
+        try:
+            r = self.s.get(API_PLAYURL, params=params, timeout=20).json()
+        except Exception as e:
+            return [], "网络异常：%s" % e
+        if r.get("code") != 0:
+            return [], r.get("message") or ("返回码 %s" % r.get("code"))
+
+        dash = (r.get("data") or {}).get("dash") or {}
+        raw = dash.get("audio") or []
+        out = []
+        for x in raw:
+            url = x.get("baseUrl") or x.get("base_url") or ""
+            if not url:
+                continue
+            out.append({
+                "id": x.get("id"),
+                "url": url,
+                "bandwidth": x.get("bandwidth", 0),
+                "codecs": x.get("codecs") or "",
+            })
+        return out, ""
+
+
+# ============================================================================
+#  字幕与弹幕的格式转换
+# ============================================================================
+def _ts_srt(seconds):
+    """秒转成 SRT 的时间格式 00:00:01,234"""
+    try:
+        s = max(0.0, float(seconds))
+    except Exception:
+        s = 0.0
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = int(s % 60)
+    ms = int(round((s - int(s)) * 1000))
+    if ms >= 1000:          # 四舍五入可能把 999.6 进位成 1000
+        ms = 0
+        sec += 1
+        if sec >= 60:
+            sec = 0
+            m += 1
+            if m >= 60:
+                m = 0
+                h += 1
+    return "%02d:%02d:%02d,%03d" % (h, m, sec, ms)
+
+
+def srt_from_bili_json(data):
+    """
+    把 B 站的字幕 JSON 转成 SRT。
+
+    源格式是一串 {from, to, content}，时间单位是秒。
+    SRT 的好处是几乎所有播放器都认，也能直接丢进剪辑软件。
+    """
+    if not isinstance(data, dict):
+        return ""
+    body = data.get("body") or []
+    lines = []
+    for i, item in enumerate(body, 1):
+        content = (item.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(str(i))
+        lines.append("%s --> %s" % (_ts_srt(item.get("from")), _ts_srt(item.get("to"))))
+        lines.append(content)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _ts_ass(seconds):
+    """秒转成 ASS 的时间格式 0:00:01.23"""
+    try:
+        s = max(0.0, float(seconds))
+    except Exception:
+        s = 0.0
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = s % 60
+    return "%d:%02d:%05.2f" % (h, m, sec)
+
+
+def _ass_color(decimal_rgb):
+    """
+    弹幕颜色是十进制 RGB，ASS 用的是 &HAABBGGRR。
+    这里不带 alpha（alpha 由样式里的 00 表示不透明），
+    所以转出来是 &H00BBGGRR 的形式，字节序要反一下。
+    """
+    try:
+        v = int(decimal_rgb)
+    except Exception:
+        v = 0xFFFFFF
+    r = (v >> 16) & 0xFF
+    g = (v >> 8) & 0xFF
+    b = v & 0xFF
+    return "&H00%02X%02X%02X" % (b, g, r)
+
+
+def ass_from_danmaku(xml_text, width=1920, height=1080,
+                     font_size=48, duration=8.0, alpha=0.85):
+    """
+    把弹幕 XML 转成 ASS 字幕。
+
+    为什么要转：XML 只有播放器自己认，ASS 到处都能用，
+    也能直接叠在视频上导出。
+
+    模式对应关系（p 属性的第 2 个字段）
+      1 和 2 滚动，3 逆向滚动，4 底部固定，5 顶部固定，
+      6 逆向，7 高级弹幕，8 代码弹幕。
+      7 和 8 涉及脚本，这里跳过不转 —— 硬转会得到一堆乱码位置。
+
+    轨道分配用的是简单的轮转法：按模式各维护一个计数器，
+    依次分到不同行，避免同一时刻所有弹幕叠在一起看不清。
+    """
+    import re as _re
+
+    header = """[Script Info]
+Title: 弹幕
+ScriptType: v4.00+
+WrapStyle: 2
+PlayResX: %d
+PlayResY: %d
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Danmaku,Microsoft YaHei,%d,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,7,0,0,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+""" % (width, height, font_size)
+
+    # 滚动弹幕从右侧进入、左侧离开；固定弹幕居中停留
+    rolls = 0
+    tops = 0
+    bottoms = 0
+    lines = []
+
+    for m in _re.finditer(r'<d\s+p="([^"]+)"\s*>([^<]*)</d>', xml_text or ""):
+        attr, content = m.group(1), m.group(2)
+        parts = attr.split(",")
+        if len(parts) < 4:
+            continue
+        try:
+            t = float(parts[0])
+            mode = int(parts[1])
+            color = int(parts[3])
+        except Exception:
+            continue
+
+        content = content.replace("\\", "\\\\").replace("{", "（").replace("}", "）")
+        content = content.replace("\n", " ").replace("\r", " ").strip()
+        if not content:
+            continue
+
+        if mode in (7, 8):
+            continue
+
+        start = t
+        end = t + duration
+        col = _ass_color(color)
+
+        if mode in (4,):
+            # 底部固定
+            row = bottoms % 4
+            bottoms += 1
+            y = height - int(font_size * 1.4) * (row + 1)
+            text = "{\\an2\\pos(%d,%d)\\c%s\\alpha&H%02X&}%s" % (
+                width // 2, max(0, y), col, int((1 - alpha) * 255), content)
+        elif mode in (5,):
+            # 顶部固定
+            row = tops % 4
+            tops += 1
+            y = int(font_size * 1.4) * (row + 1)
+            text = "{\\an8\\pos(%d,%d)\\c%s\\alpha&H%02X&}%s" % (
+                width // 2, y, col, int((1 - alpha) * 255), content)
+        else:
+            # 滚动。行数按高度算，轮转分配
+            max_rows = max(1, int(height * 0.85 / (font_size * 1.4)))
+            row = rolls % max_rows
+            rolls += 1
+            y = int(font_size * 1.4) * (row + 1)
+            text = "{\\move(%d,%d,%d,%d)\\c%s\\alpha&H%02X&}%s" % (
+                width, y, -int(len(content) * font_size * 0.6), y,
+                col, int((1 - alpha) * 255), content)
+
+        lines.append("Dialogue: 0,%s,%s,Danmaku,,0,0,0,,%s" % (
+            _ts_ass(start), _ts_ass(end), text))
+
+    return header + "\n".join(lines) + ("\n" if lines else "")
+
+
 # ============================================================================
 #  下载
 # ============================================================================
@@ -1371,6 +2036,10 @@ def download_file(session, url, path, desc, expect_size=0):
                 now = time.time()
                 if now - last_draw > 0.25:
                     last_draw = now
+                    if _QUIET:
+                        # 静默模式下不画进度条，只累计字节数。
+                        # 并发时多个线程一起写 \r 会把终端刷花
+                        continue
                     speed = (got - done) / max(0.001, now - t0)
                     if total:
                         pct = got * 100.0 / total
@@ -1392,8 +2061,10 @@ def download_file(session, url, path, desc, expect_size=0):
             r.close()
         except Exception:
             pass
-    # 用空格盖掉残留的进度条，再回到行首
-    sys.stdout.write("\r" + " " * 150 + "\r")
+    # 用空格盖掉残留的进度条，再回到行首。
+    # 静默模式没画过进度条，自然也不用擦
+    if not _QUIET:
+        sys.stdout.write("\r" + " " * 150 + "\r")
 
     if read_error is not None:
         err("%s 下载中断：%s" % (desc, read_error))
@@ -1409,7 +2080,7 @@ def download_file(session, url, path, desc, expect_size=0):
     return True, got
 
 
-def try_merged(session, info, outdir):
+def try_merged(session, vinfo, outdir, base_path=None):
     """
     下载已合并的 MP4。
 
@@ -1417,23 +2088,29 @@ def try_merged(session, info, outdir):
     偶尔会遇到切片的视频，这时逐个下到临时目录再拼起来。
     拼接用二进制追加即可——同一视频的分片格式相同，
     MP4 允许这样简单连接，不需要重新封装。
+
+    base_path 是调用方算好的目标路径（不含扩展名）。
+    传进来就按它存，没传就退回按标题拼 —— 后者是为了兼容旧调用方式。
+    命名模板算出来的路径要能带上子目录，所以必须由调用方给，
+    在这里自己拼的话模板信息就丢了。
     """
-    title = sanitize(info["title"])
-    path = os.path.join(outdir, title + ".mp4")
+    path = (base_path or os.path.join(outdir, sanitize(vinfo["title"]))) + ".mp4"
+    os.makedirs(os.path.dirname(path) or outdir, exist_ok=True)
 
     # 同名文件已存在就跳过，避免重复下载
     if os.path.exists(path) and os.path.getsize(path) > 0:
-        info["skipped"] = True
+        vinfo["skipped"] = True
         return path
 
-    parts = info["parts"]
+    parts = vinfo["parts"]
     if len(parts) == 1:
         url, size = parts[0]
         good, got = download_file(session, url, path, "下载中", size)
         return path if good else None
 
-    # 多分片  逐个下载后拼接
-    tmpdir = os.path.join(outdir, ".parts")
+    # 多分片  逐个下载后拼接。
+    # 临时目录名带上目标文件的标识，避免同一目录下多个任务互相覆盖
+    tmpdir = os.path.join(outdir, ".parts_" + str(abs(hash(path)) % 100000000))
     os.makedirs(tmpdir, exist_ok=True)
     files = []
     try:
@@ -1452,28 +2129,32 @@ def try_merged(session, info, outdir):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def try_dash(session, info, outdir):
+def try_dash(session, vinfo, outdir, base_path=None):
     """
     处理 DASH 分轨的兜底路径。
 
     视频轨和音频轨各下一个文件，能合并就合并。
     合并失败也不是错误，两个文件都在，用播放器分别加载照样能看，
     只是麻烦一点。所以这里不返回失败，只把情况说清楚。
+
+    base_path 含义同 try_merged。
     """
-    title = sanitize(info["title"])
-    vurl, _ = info["video"]
-    vpath = os.path.join(outdir, title + ".video.mp4")
+    base = base_path or os.path.join(outdir, sanitize(vinfo["title"]))
+    os.makedirs(os.path.dirname(base) or outdir, exist_ok=True)
+
+    vurl, _ = vinfo["video"]
+    vpath = base + ".video.mp4"
     good, _ = download_file(session, vurl, vpath, "视频轨")
     if not good:
         return None
     result = vpath
 
-    if info.get("audio"):
-        aurl, _ = info["audio"]
-        apath = os.path.join(outdir, title + ".audio.mp4")
+    if vinfo.get("audio"):
+        aurl, _ = vinfo["audio"]
+        apath = base + ".audio.mp4"
         good2, _ = download_file(session, aurl, apath, "音频轨")
         if good2:
-            merged = merge_with_ffmpeg(vpath, apath, os.path.join(outdir, title + ".mp4"))
+            merged = merge_with_ffmpeg(vpath, apath, base + ".mp4")
             if merged:
                 # 合并成功就把两个中间文件清掉，只留成品
                 try:
@@ -1483,7 +2164,8 @@ def try_dash(session, info, outdir):
                     pass
                 result = merged
             else:
-                print()
+                if not _QUIET:
+                    print()
                 warn("没有找到 ffmpeg，音视频已分开保存。")
                 info("安装 ffmpeg 后重新运行即可自动合并，或用播放器分别加载。")
                 info("视频文件：" + vpath)
@@ -1537,6 +2219,303 @@ def merge_with_ffmpeg(vpath, apath, outpath):
     except Exception as e:
         err("调用 ffmpeg 失败：%s" % e)
     return None
+
+
+def ffmpeg_convert_to_mp3(src, dst):
+    """
+    有 ffmpeg 就把 m4a 转成 mp3，没有就算了。
+
+    转与不转都能听，区别是兼容性：m4a 在老播放器和一些车载设备上认不出来。
+    转码会损失一点音质，而且慢，所以只在用户明确要 mp3 时才调。 
+    """
+    exe = find_ffmpeg()
+    if not exe:
+        return None
+    import subprocess
+    try:
+        r = subprocess.run(
+            [exe, "-y", "-loglevel", "error", "-i", src,
+             "-acodec", "libmp3lame", "-q:a", "2", dst],
+            capture_output=True, timeout=1800)
+        if r.returncode == 0 and os.path.exists(dst):
+            return dst
+    except Exception:
+        pass
+    return None
+
+
+# ============================================================================
+#  附加内容：封面、元数据、字幕
+# ============================================================================
+def download_cover(session, url, path):
+    """
+    下封面图。
+
+    封面地址有时是 http，B 站对这类请求不严，直接取即可。
+    图不大，几十一百 KB，不值得为它做断点续传。
+    """
+    if not url:
+        return None
+    try:
+        r = session.get(url, timeout=30,
+                        headers={"Referer": "https://www.bilibili.com/",
+                                 "User-Agent": UA})
+        if r.status_code != 200 or not r.content:
+            return None
+        # 后缀按响应类型定，别硬写 jpg
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        ext = ".jpg"
+        if "png" in ctype:
+            ext = ".png"
+        elif "webp" in ctype:
+            ext = ".webp"
+        out = path + ext
+        with open(out, "wb") as f:
+            f.write(r.content)
+        return out
+    except Exception:
+        return None
+
+
+def write_metadata(path, vinfo, page=None, extra=None):
+    """
+    把视频信息写成 JSON，跟视频放一起。
+
+    存的是"以后还想知道"的那些字段，不是把接口返回整个倒出来 ——
+    那样文件又大又难读，还容易把一堆内部字段带出去。
+    半年后回头看这个文件，标题、作者、发布时间、原始链接都在，
+    足够对上号了。
+    """
+    def _g(d, *keys):
+        cur = d
+        for k in keys:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(k)
+        return cur
+
+    data = {
+        "bvid": vinfo.get("bvid"),
+        "aid": vinfo.get("aid"),
+        "title": vinfo.get("title"),
+        "up": _g(vinfo, "owner", "name"),
+        "up_mid": _g(vinfo, "owner", "mid"),
+        "pubdate": vinfo.get("pubdate"),
+        "ctime": vinfo.get("ctime"),
+        "duration": (page or {}).get("duration") or vinfo.get("duration"),
+        "desc": vinfo.get("desc"),
+        "cover": vinfo.get("pic"),
+        "url": "https://www.bilibili.com/video/%s" % (vinfo.get("bvid") or ""),
+        "stat": {
+            "view": _g(vinfo, "stat", "view"),
+            "danmaku": _g(vinfo, "stat", "danmaku"),
+            "reply": _g(vinfo, "stat", "reply"),
+            "favorite": _g(vinfo, "stat", "favorite"),
+            "like": _g(vinfo, "stat", "like"),
+        },
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if page:
+        data["page"] = {
+            "index": page.get("page"),
+            "part": page.get("part"),
+            "cid": page.get("cid"),
+        }
+    if extra:
+        data.update(extra)
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return path
+    except Exception:
+        return None
+
+
+def save_sidecar(bili, vinfo, page, base_path, opts):
+    """
+    统一下载各类附加内容。
+
+    opts 里控制要哪些：subtitle / danmaku / cover / metadata。
+    每一类都独立 try 住 —— 附加内容失败不该影响视频本身，
+    视频已经下好了，封面取不到也就是少张图的事。
+    """
+    saved = {}
+    bvid = vinfo.get("bvid") or ""
+    cid = (page or {}).get("cid")
+    aid = vinfo.get("aid")
+
+    # ---- 封面 ----
+    if opts.get("cover"):
+        try:
+            p = download_cover(bili.s, vinfo.get("pic"), base_path + ".cover")
+            if p:
+                saved["cover"] = p
+        except Exception:
+            pass
+
+    # ---- 字幕 ----
+    if opts.get("subtitle"):
+        try:
+            subs, serr = bili.subtitles(bvid, cid, aid)
+            if subs:
+                # 优先中文，其次第一条。语言标记里带 zh 的都算中文
+                pick = None
+                for s in subs:
+                    if (s.get("lan") or "").lower().startswith("zh"):
+                        pick = s
+                        break
+                if not pick:
+                    pick = subs[0]
+                data, derr = bili.fetch_subtitle(pick["url"])
+                if data:
+                    srt = srt_from_bili_json(data)
+                    if srt.strip():
+                        # 多语言时文件名带上语言标记，免得互相覆盖
+                        suffix = ".srt" if len(subs) == 1 else (".%s.srt" % (pick.get("lan") or "sub"))
+                        sp = base_path + suffix
+                        with open(sp, "w", encoding="utf-8") as f:
+                            f.write(srt)
+                        saved["subtitle"] = sp
+                if serr and not data:
+                    saved["subtitle_error"] = serr
+            elif serr:
+                saved["subtitle_error"] = serr
+        except Exception as e:
+            saved["subtitle_error"] = str(e)
+
+    # ---- 弹幕 ----
+    if opts.get("danmaku") and cid:
+        try:
+            xml, xerr = bili.danmaku(cid)
+            if xml.strip():
+                xp = base_path + ".danmaku.xml"
+                with open(xp, "w", encoding="utf-8") as f:
+                    f.write(xml)
+                saved["danmaku"] = xp
+                ass = ass_from_danmaku(xml)
+                if ass.strip():
+                    ap = base_path + ".danmaku.ass"
+                    with open(ap, "w", encoding="utf-8") as f:
+                        f.write(ass)
+                    saved["danmaku_ass"] = ap
+        except Exception:
+            pass
+
+    # ---- 元数据 ----
+    if opts.get("metadata"):
+        try:
+            mp = write_metadata(base_path + ".info.json", vinfo, page,
+                                extra={"sidecar": {k: os.path.basename(v)
+                                                   for k, v in saved.items()
+                                                   if isinstance(v, str)}})
+            if mp:
+                saved["metadata"] = mp
+        except Exception:
+            pass
+
+    return saved
+
+
+def try_audio(bili, vinfo, page, outdir, want_mp3=False):
+    """
+    只下音频。
+
+    走 DASH 取音频轨，选码率最高的那条，存成 m4a。
+    之所以不把视频也下了再抽音频，是因为那样白下载几十上百 MB 的视频流。
+
+    文件名后缀故意用 .m4a 而不是 .mp4：
+    有些播放器看到 .mp4 会当成视频去找画面，找不到就报错；
+    标成 .m4a 它们就知道这是纯音频。
+    """
+    bvid = vinfo.get("bvid") or ""
+    cid = (page or {}).get("cid")
+    ctx = template_context(vinfo, page, page.get("part") or "",
+                           page.get("page") or 0, "音频")
+    base = os.path.join(outdir, build_relpath(_current_template(), ctx))
+    os.makedirs(os.path.dirname(base) or outdir, exist_ok=True)
+
+    tracks, e = bili.audio_tracks(bvid, cid)
+    if e:
+        err("取音频轨失败：%s" % e)
+        return None, {}
+    if not tracks:
+        err("这个视频没有可用的音频轨")
+        return None, {}
+
+    best = max(tracks, key=lambda x: x.get("bandwidth", 0))
+    qname = AUDIO_QUALITY_NAME.get(best.get("id"), "未知")
+    info("音频档位 %s  %.0f kbps" % (qname, best.get("bandwidth", 0) / 1000.0))
+
+    path = base + ".m4a"
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        warn("文件已存在，跳过：" + path)
+        return path, {}
+
+    good, _got = download_file(bili.s, best["url"], path, "音频下载中",
+                               _content_length(bili.s, best["url"]))
+    if not good:
+        return None, {}
+
+    if want_mp3:
+        mp3 = base + ".mp3"
+        converted = ffmpeg_convert_to_mp3(path, mp3)
+        if converted:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            info("已转成 mp3：" + mp3)
+            path = converted
+        else:
+            info("未找到 ffmpeg，保留 m4a 格式（大多数播放器都能放）")
+
+    return path, {}
+
+
+def _content_length(session, url):
+    """只发一个 HEAD 或 Range 探测拿文件大小，失败返回 0"""
+    try:
+        r = session.get(url, stream=True, timeout=20,
+                        headers={"Referer": "https://www.bilibili.com/",
+                                 "User-Agent": UA, "Range": "bytes=0-0"})
+        cr = r.headers.get("Content-Range") or ""
+        r.close()
+        if "/" in cr:
+            return int(cr.split("/")[-1])
+    except Exception:
+        pass
+    return 0
+
+
+# 模板存在这个模块级变量里，由 CLI 初始化时写入。
+# 不用全局配置对象是因为 download_file 这类底层函数不该依赖配置结构，
+# 而文件名又得在多个地方保持一致
+_TEMPLATE = "{title}"
+
+
+def set_template(tpl):
+    """设置本次运行使用的命名模板"""
+    global _TEMPLATE
+    _TEMPLATE = tpl or "{title}"
+    return _TEMPLATE
+
+
+def _current_template():
+    return _TEMPLATE
+
+
+# 静默开关的状态值定义在文件前面（info/ok/step 要用），
+# 这里只放操作它的函数
+def set_quiet(on):
+    """开启或关闭静默模式"""
+    global _QUIET
+    _QUIET = bool(on)
+    return _QUIET
+
+
+def is_quiet():
+    return _QUIET
 
 
 # ============================================================================
@@ -1617,25 +2596,51 @@ NOTICE = """\
 """
 
 
-def get_outdir(argv):
-    """取下载目录。命令行给了 -o 就用它，没给就用默认目录，都确保目录存在"""
+def get_outdir(argv, cfg=None):
+    """
+    取下载目录，优先级是 命令行 -o > 配置文件 > 内置默认。
+
+    三种来源都要保证目录存在，否则后面写文件会失败
+    """
     for i, a in enumerate(argv):
         if a in ("-o", "--out") and i + 1 < len(argv):
             d = argv[i + 1]
             os.makedirs(d, exist_ok=True)
             return d
+    if cfg and cfg.get("outdir"):
+        d = cfg["outdir"]
+        os.makedirs(d, exist_ok=True)
+        return d
     os.makedirs(DEFAULT_OUTDIR, exist_ok=True)
     return DEFAULT_OUTDIR
 
 
-def download_one(bili, link, page=None, outdir=None, qn=None, all_parts=False):
+def download_one(bili, link, page=None, outdir=None, qn=None, all_parts=False,
+                 opts=None, sink=None):
     """
     下载一个链接。
 
     page 是命令行 -p 指定的分P，为 None 时看情况：
     单P视频直接用，多P视频会问用户要哪一个。
     all_parts 为真则不分P，全部下。
+
+    opts 是附加选项字典，可含 template / subtitle / danmaku / cover /
+    metadata / audio_only / audio_mp3。不传就用全默认（只下视频本体）。
+
+    sink 传一个字典进来，会把产物路径填进 sink["paths"]。
+    网页版需要知道文件落在哪才能给出下载链接，命令行不需要这个，
+    所以做成可选参数，不传就什么都不记。
     """
+    o = dict(opts or {})
+    tmpl = o.get("template") or _current_template()
+    want_audio = bool(o.get("audio_only"))
+
+    def record(path):
+        if sink is not None and path:
+            sink.setdefault("paths", []).append(path)
+            if o.get("skipped_any") is not None:
+                pass
+
     bvid, aid, pg = parse_link(link)
     if not bvid and not aid:
         # 解析不出来时把能用的写法列给对方，比只说"链接无效"有用
@@ -1672,24 +2677,28 @@ def download_one(bili, link, page=None, outdir=None, qn=None, all_parts=False):
             warn("同时指定了 --all 与 -p，按 --all 处理，下载全部分P。")
         targets = list(range(len(pages)))
     elif len(pages) > 1 and page is None:
-        print()
-        print(C.B + "  这是一个多分P视频，共 %d 个分P：" % len(pages) + C.R)
-        for i, p in enumerate(pages[:30], 1):
-            print("    %2d. %s  (%s)" % (i, sanitize(p.get("part", ""), 46),
-                                         fmt_dur(p.get("duration", 0))))
-        if len(pages) > 30:
-            print("    ... 其余 %d 个" % (len(pages) - 30))
-        print()
+        # 分P 列表只在有人看的时候才值得排版。静默模式（批量下载、网页版）
+        # 下几十个视频各打十行，终端就没法看了
+        if not _QUIET:
+            print()
+            print(C.B + "  这是一个多分P视频，共 %d 个分P：" % len(pages) + C.R)
+            for i, p in enumerate(pages[:30], 1):
+                print("    %2d. %s  (%s)" % (i, sanitize(p.get("part", ""), 46),
+                                             fmt_dur(p.get("duration", 0))))
+            if len(pages) > 30:
+                print("    ... 其余 %d 个" % (len(pages) - 30))
+            print()
 
-        # 非交互环境（管道、重定向、计划任务）里 stdin 没有输入源，
-        # 直接调 input() 会抛 EOFError 把程序顶掉。所以先判断再问
-        if not sys.stdin or not sys.stdin.isatty():
-            warn("当前非交互环境，自动选择第 1 个分P。")
-            info("要下载指定分P请加 -p 序号，要全部下载请加 --all")
+        # 能不能问，取决于调用方有没有声明"有人在终端前"，
+        # 而不是进程的 stdin 长什么样。见 set_interactive 的说明
+        if not is_interactive() or not sys.stdin or not sys.stdin.isatty():
+            # 只留一行。批量下载里多P 视频可能很多，这里每个都打两行
+            # 会把终端刷满；网页版那边本来就有"共几P"的显示
+            warn("多分P 视频（共 %d 个），只取第 1 个分P。" % len(pages))
             targets = [0]
         else:
             try:
-                sel = input("  请输入分P序号（回车默认第 1 个，输入 all 下载全部）：").strip().lower()
+                sel = safe_input("  请输入分P序号（回车默认第 1 个，输入 all 下载全部）：").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 # 用户按了 Ctrl+C 或输入流断了，当成默认选择，不算错误
                 print()
@@ -1723,8 +2732,11 @@ def download_one(bili, link, page=None, outdir=None, qn=None, all_parts=False):
         if len(pages) > 1:
             title = "%s [P%d]%s" % (title, idx + 1, (" " + part) if part else "")
 
-        print()
-        print(C.B + "  " + "─" * 70 + C.R)
+        # 这块信息框是给人读的。静默模式下上面的 info() 已经不输出了，
+        # 只剩这几行分隔线会漏出来，变成一串莫名的空行和横线
+        if not _QUIET:
+            print()
+            print(C.B + "  " + "─" * 70 + C.R)
         info("标题   " + data.get("title", ""))
         if len(pages) > 1:
             info("分P    P%d / %d  %s" % (idx + 1, len(pages), part))
@@ -1735,7 +2747,25 @@ def download_one(bili, link, page=None, outdir=None, qn=None, all_parts=False):
         real_aid = data.get("aid") or aid or ""
         info("编号   " + ("BV" + real_bvid[2:] if real_bvid.startswith("BV")
                           else (real_bvid or ("av%s" % real_aid))))
-        print()
+        if not _QUIET:
+            print()
+
+        # ---- 只下音频的分支，走完就进入下一个分P ----
+        if want_audio:
+            step("正在取音频轨")
+            path, sidecar = try_audio(bili, data, p, outdir,
+                                      want_mp3=bool(o.get("audio_mp3")))
+            if path and os.path.exists(path):
+                record(path)
+                ok("已保存 " + path + "  （" + fmt_size(os.path.getsize(path)) + "）")
+                # 音频也允许带封面和元数据，做音乐库时有用
+                base = os.path.splitext(path)[0]
+                if o.get("cover") or o.get("metadata"):
+                    save_sidecar(bili, data, p, base, o)
+            else:
+                err("音频下载未完成")
+                all_ok = False
+            continue
 
         step("正在获取下载地址")
         info_play, e = bili.playurl(data.get("bvid") or bvid, cid, qn=qn)
@@ -1790,25 +2820,68 @@ def download_one(bili, link, page=None, outdir=None, qn=None, all_parts=False):
         if info_play["kind"] == "dash":
             warn("该视频只有 DASH 分轨，需要一个 ffmpeg 来合并音视频")
 
+        # 按命名模板算出目标路径（不含扩展名）
+        ctx = template_context(data, p, part, idx + 1, qname)
+        base_path = os.path.join(outdir, build_relpath(tmpl, ctx,
+                                                       fallback="video"))
+
         item = {"title": title, "skipped": False}
         item.update(info_play)
         item["parts"] = info_play.get("parts") or []
 
         step("开始下载")
         if info_play["kind"] == "merged":
-            path = try_merged(bili.s, item, outdir)
+            path = try_merged(bili.s, item, outdir, base_path)
         else:
-            path = try_dash(bili.s, item, outdir)
+            path = try_dash(bili.s, item, outdir, base_path)
 
         if item.get("skipped"):
+            record(path)
             warn("文件已存在，跳过：" + path)
+            # 跳过的文件也可能缺字幕封面，顺手补齐
+            if path:
+                _save_sidecar_quiet(bili, data, p, os.path.splitext(path)[0], o)
         elif path and os.path.exists(path):
+            record(path)
             ok("已保存 " + path + "  （" + fmt_size(os.path.getsize(path)) + "）")
+            _save_sidecar_quiet(bili, data, p, os.path.splitext(path)[0], o)
         else:
             err("下载未完成")
             all_ok = False
 
     return all_ok
+
+
+def _save_sidecar_quiet(bili, vinfo, page, base_path, opts):
+    """
+    下载附加内容并汇报结果。
+
+    单独包一层是为了把"报告"和"干活"分开：
+    save_sidecar 只管下载并返回路径，这里负责把结果讲给用户听。
+    任何一步失败都只提示，不影响视频本身的成功判定。
+    """
+    if not any(opts.get(k) for k in ("subtitle", "danmaku", "cover", "metadata")):
+        return {}
+    try:
+        got = save_sidecar(bili, vinfo, page, base_path, opts)
+    except Exception as e:
+        warn("附加内容处理出错：%s" % e)
+        return {}
+
+    names = []
+    if got.get("cover"):
+        names.append("封面")
+    if got.get("subtitle"):
+        names.append("字幕")
+    if got.get("danmaku"):
+        names.append("弹幕")
+    if got.get("metadata"):
+        names.append("元数据")
+    if names:
+        info("附加内容已保存：" + "、".join(names))
+    if got.get("subtitle_error") and opts.get("subtitle"):
+        warn("字幕未取到：" + str(got["subtitle_error"])[:80])
+    return got
 
 
 def interactive(bili):
@@ -1827,7 +2900,7 @@ def interactive(bili):
         ok("已登录：%s%s" % (uname, "（大会员）" if vip else ""))
     else:
         warn("当前未登录。游客可下载 720P 及以下，登录后可取更高清晰度。")
-        ans = input("  现在扫码登录吗？[y/N] ").strip().lower()
+        ans = safe_input("  现在扫码登录吗？[y/N] ").strip().lower()
         if ans == "y":
             bili.qr_login()
             print()
@@ -1838,7 +2911,7 @@ def interactive(bili):
 
     while True:
         try:
-            line = input(C.B + "  链接> " + C.R).strip()
+            line = safe_input(C.B + "  链接> " + C.R).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -1847,7 +2920,7 @@ def interactive(bili):
         if line.lower() in ("q", "quit", "exit"):
             break
         if line.lower() == "dir":
-            d = input("  新目录：").strip().strip('"')
+            d = safe_input("  新目录：").strip().strip('"')
             if d:
                 try:
                     os.makedirs(d, exist_ok=True)
@@ -1877,6 +2950,20 @@ def main():
     这样写在脚本或计划任务里能直接判 returncode。
     """
     argv = sys.argv[1:]
+    # 先声明"现在有没有人回答问题"。管道、重定向、计划任务里没有，
+    # 这时所有交互提示都要自动走默认值，不能傻等
+    try:
+        set_interactive(bool(sys.stdin is not None and sys.stdin.isatty()))
+    except Exception:
+        set_interactive(False)
+
+    # 自动确认开关必须最先解析。
+    #
+    # 这里踩过一次：原本把它放在 --fav 分支之后，结果 --fav 那条路提前 return，
+    # 开关根本没生效，批量下载在非交互环境下照样卡在"确认开始？"。
+    # 凡是全局开关都得在分发之前处理。
+    if any(a in ("-y", "--yes") for a in argv):
+        set_assume_yes(True)
 
     if not argv:
         interactive(Bili())
@@ -1890,6 +2977,7 @@ def main():
         return 0
 
     bili = Bili()
+    cfg = load_config()
 
     cmd = argv[0]
     if cmd in ("--login", "-l"):
@@ -1913,6 +3001,55 @@ def main():
         ok("已清除本机保存的登录凭证")
         return 0
 
+    # ---- 配置管理 ----
+    if cmd == "--show-config":
+        print(BANNER)
+        info("配置文件：" + CONFIG_FILE)
+        info("存在：" + ("是" if os.path.exists(CONFIG_FILE) else "否（当前用的是默认值）"))
+        print()
+        for k in DEFAULT_CONFIG:
+            cur = cfg.get(k)
+            info("  %-14s %s" % (k, json.dumps(cur, ensure_ascii=False)))
+        print()
+        info("模板可用字段：")
+        for k, d in TEMPLATE_FIELDS.items():
+            info("  {%s}   %s" % (k, d))
+        return 0
+
+    if cmd == "--set":
+        print(BANNER)
+        if len(argv) < 2 or "=" not in argv[1]:
+            err("用法： --set key=value     例如 --set template=\"{up}/{title}\"")
+            return 2
+        key, _, rawval = argv[1].partition("=")
+        key = key.strip()
+        if key not in DEFAULT_CONFIG:
+            err("未知配置项：%s" % key)
+            info("可用的项：" + "、".join(DEFAULT_CONFIG.keys()))
+            return 2
+        try:
+            val = coerce_config_value(key, rawval)
+        except Exception as e:
+            err("值不合法：%s" % e)
+            return 2
+        cfg[key] = val
+        if save_config(cfg):
+            ok("已设置 %s = %s" % (key, json.dumps(val, ensure_ascii=False)))
+            info("配置文件：" + CONFIG_FILE)
+            return 0
+        return 1
+
+    if cmd == "--fav":
+        # 收藏夹相关功能放在单独模块里，按需导入避免循环依赖
+        try:
+            import bili_fav
+        except ImportError:
+            err("找不到 bili_fav.py，它应该和 bili_dl.py 放在同一目录")
+            return 2
+        print(BANNER)
+        print(NOTICE)
+        return bili_fav.main(bili, cfg, argv[1:])
+
     # 下载模式
     if cmd in ("-o", "--out"):
         err("参数顺序不对。请把链接放在最前面。")
@@ -1923,7 +3060,23 @@ def main():
     # 用 -q 显式指定时才按指定值请求
     qn = None
     all_parts = False
-    outdir = get_outdir(argv)
+
+    # 附加内容的开关。默认全关，命令行给了才开；
+    # 配置文件里开过的会作为默认值带进来
+    opts = {
+        "template": cfg.get("template") or "{title}",
+        "subtitle": bool(cfg.get("subtitle")),
+        "danmaku": bool(cfg.get("danmaku")),
+        "cover": bool(cfg.get("cover")),
+        "metadata": bool(cfg.get("metadata")),
+        "audio_only": bool(cfg.get("audio_only")),
+        "audio_mp3": False,
+    }
+
+    # 命令行里 -o 优先，其次配置文件，最后默认目录
+    outdir = get_outdir(argv, cfg)
+
+
     for i, a in enumerate(argv):
         if a in ("-p", "--page") and i + 1 < len(argv) and argv[i + 1].isdigit():
             page = int(argv[i + 1])
@@ -1931,11 +3084,55 @@ def main():
             qn = int(argv[i + 1])
         if a in ("-a", "--all"):
             all_parts = True
+        if a in ("-t", "--template") and i + 1 < len(argv):
+            opts["template"] = argv[i + 1]
+        # 分开的开关，方便只要其中一两样
+        if a in ("--subtitle", "--sub"):
+            opts["subtitle"] = True
+        if a in ("--danmaku", "--dm"):
+            opts["danmaku"] = True
+        if a in ("--cover",):
+            opts["cover"] = True
+        if a in ("--metadata", "--meta"):
+            opts["metadata"] = True
+        # 一次全开，省得敲一串
+        if a in ("--all-extras", "--extras"):
+            opts["subtitle"] = True
+            opts["danmaku"] = True
+            opts["cover"] = True
+            opts["metadata"] = True
+        if a in ("--audio-only", "--audio"):
+            opts["audio_only"] = True
+        if a in ("--mp3",):
+            opts["audio_mp3"] = True
+            opts["audio_only"] = True
+
+    qn = qn if qn is not None else cfg.get("quality")
+
+    # 模板写进模块变量，下载时各层都能取到一致的值
+    set_template(opts["template"])
+
+    # 音频与字幕都要登录才能拿到完整内容，没登录先说一句，免得用户以为是视频的问题
+    if opts["subtitle"] or opts["danmaku"]:
+        logged_now, _n, _v = bili.whoami()
+        if logged_now:
+            pass
+        else:
+            # 弹幕其实不需要登录，字幕比较需要。这里只提示不阻拦
+            if opts["subtitle"]:
+                warn("未登录。字幕接口对未登录用户常返回空内容，"
+                     "建议先运行 --login 扫码登录。")
+        if not logged_now and not opts["subtitle"]:
+            pass
 
     print(BANNER)
     print(NOTICE)
+    if opts["audio_only"]:
+        info("模式：仅下载音频")
+    if opts["template"] != "{title}":
+        info("命名模板：" + opts["template"])
     okd = download_one(bili, cmd, page=page, outdir=outdir, qn=qn,
-                       all_parts=all_parts)
+                       all_parts=all_parts, opts=opts)
     print()
     return 0 if okd else 1
 

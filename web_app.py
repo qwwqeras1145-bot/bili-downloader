@@ -52,6 +52,7 @@ r"""
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -79,10 +80,10 @@ except ImportError:
     sys.exit(1)
 
 APP_TITLE = "B站视频下载器 · 网页版"
-APP_VER = "1.0"
+# 和命令行版同一个版本号：两个版本一起发布，共用同一套下载逻辑和测试，
+# 各自编号只会让人分不清哪个是哪个
+APP_VER = "1.3"
 
-# 下载任务默认存两个文件：视频轨与音频轨各自一个。
-# 这里只接已合并的 MP4，DASH 分轨在网页版里提示用户改用命令行版
 MAX_JOBS = 50               # 内存里最多保留多少个历史任务
 JOB_TTL = 6 * 3600          # 任务记录保留多久（秒）
 
@@ -248,90 +249,160 @@ class CountingSession:
         return getattr(self._s, name)
 
 
-def run_download(job, bvid, cid, title):
+def run_download(job, link, title, opts=None):
     """
     后台线程里跑的下载流程。
 
+    直接复用命令行版的 download_one，而不是在这里另写一遍。
+    理由是行为一致：清晰度选择、模板命名、字幕弹幕封面元数据、
+    断点续传全都是同一套代码，网页和命令行不会出现"这边能下那边不行"。
+
+    传给 download_one 的 sink 是用来回收产物路径的 ——
+    网页需要知道文件落在哪，才能给出下载链接。
+
     整个过程包在 try 里。这里抛异常不会有人接，
     线程会静默死掉、任务永远停在"下载中"，网页就一直转圈。
-    所以无论出什么事都要把任务置成终态
+    所以无论出什么事都要把任务置成终态。
     """
     try:
+        o = dict(opts or {})
+        if job.qn is not None:
+            o["qn"] = job.qn
+
+        job.set(state="running", message="准备中")
+
         bili = core.Bili()
-        job.set(state="running", message="正在获取下载地址")
+        # 包一层计数会话，让 download_one 内部的请求流量也能统计到进度
+        bili.s = CountingSession(bili.s, job)
 
-        play, err = bili.playurl(bvid, cid, qn=job.qn)
-        if err:
-            job.set(state="error", error=err, message="获取地址失败", finished=time.time())
-            return
-        if not play:
-            job.set(state="error", error="没有可用的下载地址", finished=time.time())
-            return
-
-        # DASH 分轨需要 ffmpeg 合并，网页版不做这件事，
-        # 直接说明并让用户改用命令行版。硬要在网页里拼轨只会做出个半成品
-        if play.get("kind") != "merged":
-            msg = ("该视频只提供 DASH 分轨，网页版不支持合并音视频。"
-                   "请改用命令行版：python bili_dl.py <链接>")
-            job.set(state="error", error=msg, message="需要命令行版处理",
-                    finished=time.time())
-            return
-
-        parts = play.get("parts") or []
-        if not parts:
-            job.set(state="error", error="下载地址为空", finished=time.time())
-            return
-
-        q = play.get("quality")
-        qname = core.QUALITY_NAME.get(q, str(q))
-        job.set(message="清晰度 %s" % qname)
-
-        total = sum(sz for _u, sz in parts)
-        job.set(total_bytes=total)
-
-        os.makedirs(job.outdir, exist_ok=True)
-
-        # 单分片就直接下，多分片先下到临时目录再拼
-        session = CountingSession(bili.s, job)
-        if len(parts) == 1:
-            url, _size = parts[0]
-            out = os.path.join(job.outdir, core.sanitize(title) + ".mp4")
-            ok, _got = core.download_file(session, url, out, "下载中", total)
-            if not ok:
-                job.set(state="error", error="下载未完成，可重新点击继续",
-                        message="已中断", finished=time.time())
-                return
-            job.set(state="done", path=out, message="下载完成", finished=time.time())
-            return
-
-        tmpdir = os.path.join(job.outdir, ".parts_%s" % job.id)
-        os.makedirs(tmpdir, exist_ok=True)
-        got_files = []
+        # 静默模式：进度由网页显示，服务端控制台不需要刷进度条
+        prev_quiet = core.is_quiet()
+        prev_iact = core.is_interactive()
+        core.set_quiet(True)
+        # 关键：下载跑在后台线程里，即使服务是在终端启动的，
+        # 这里也绝不能弹交互提示 —— 多P 视频会问"下哪个分P"，
+        # 没人回答，线程就永远停住，网页上只看到进度条停在 0%
+        core.set_interactive(False)
+        sink = {}
         try:
-            for i, (url, size) in enumerate(parts, 1):
-                p = os.path.join(tmpdir, "p%03d" % i)
-                job.set(message="分片 %d/%d" % (i, len(parts)))
-                before = job.done_bytes
-                ok, _g = core.download_file(session, url, p, "分片%d" % i, size)
-                if not ok:
-                    job.set(state="error", error="分片 %d 下载失败" % i,
-                            message="已中断", finished=time.time())
-                    return
-                got_files.append(p)
-            out = os.path.join(job.outdir, core.sanitize(title) + ".mp4")
-            with open(out, "wb") as of:
-                for p in got_files:
-                    with open(p, "rb") as f:
-                        shutil.copyfileobj(f, of, 1024 * 1024)
-            job.set(state="done", path=out, message="下载完成", finished=time.time())
+            okflag = core.download_one(bili, link, outdir=job.outdir,
+                                       qn=o.get("qn"),
+                                       all_parts=bool(o.get("all_parts")),
+                                       opts=o, sink=sink)
         finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            core.set_quiet(prev_quiet)
+            core.set_interactive(prev_iact)
+
+        paths = sink.get("paths") or []
+        if okflag and paths:
+            job.set(state="done", path=paths[0], message="下载完成",
+                    finished=time.time())
+        elif okflag:
+            job.set(state="done", message="下载完成", finished=time.time())
+        else:
+            job.set(state="error", error="下载未完成，可重新点击继续",
+                    message="已中断", finished=time.time())
 
     except Exception as e:
         import traceback
         job.set(state="error", error="%s: %s" % (type(e).__name__, e),
                 message="出现异常", finished=time.time())
         traceback.print_exc()
+
+
+# ============================================================================
+#  批量下载
+# ============================================================================
+class Batch:
+    """
+    一批视频的下载。
+
+    每一项复用 Job 对象，这样单个视频的进度、产物路径、
+    失败原因都能沿用同一套结构，网页也只有一种数据结构要处理。
+    """
+
+    def __init__(self, name, items, outdir, qn=None, opts=None):
+        self.id = uuid.uuid4().hex[:12]
+        self.name = name
+        self.outdir = outdir
+        self.qn = qn
+        self.opts = dict(opts or {})
+        self.created = time.time()
+        self.finished = None
+        self.state = "running"
+        self.entries = []      # [{'bvid','title','job'}]
+        self._lock = threading.Lock()
+        for it in items:
+            j = Job(it.get("bvid") or "", it.get("title") or "",
+                    outdir, qn)
+            self.entries.append({"bvid": it.get("bvid"),
+                                 "title": it.get("title") or "",
+                                 # parts 是分P 总数，只用来显示"共几P"。
+                                 # 不能拿它拼 ?p=N —— 那是"第几P"，含义完全不同
+                                 "parts": it.get("parts") or 1,
+                                 "job": j})
+
+    def snapshot(self):
+        with self._lock:
+            done = sum(1 for e in self.entries
+                       if e["job"].state in ("done", "error"))
+            failed = [e for e in self.entries if e["job"].state == "error"]
+            return {
+                "id": self.id,
+                "name": self.name,
+                "state": self.state,
+                "total": len(self.entries),
+                "done": done,
+                "failed": len(failed),
+                "pct": round(done * 100.0 / len(self.entries), 1) if self.entries else 0,
+                "items": [{
+                    "bvid": e["bvid"],
+                    "title": e["title"],
+                    "parts": e.get("parts") or 1,
+                    "state": e["job"].state,
+                    "error": e["job"].error,
+                    "pct": e["job"].snapshot()["pct"],
+                    "done_h": e["job"].snapshot()["done_h"],
+                    "path": os.path.basename(e["job"].path) if e["job"].path else None,
+                    "job": e["job"].id,
+                } for e in self.entries],
+            }
+
+
+BATCHES = {}
+BATCH_LOCK = threading.Lock()
+
+
+def run_batch(batch, workers=2):
+    """
+    并发跑一批。
+
+    并发数刻意压得比命令行低：网页通常开着看进度，
+    同时太多连接反而让单个视频变慢，也更容易触发服务端限流。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(entry):
+        job = entry["job"]
+        # 不加 ?p=：收藏夹接口只给分P 总数，给不出"第几P"。
+        # 默认下第 1 个分P，要全下由 opts 的 all_parts 决定
+        link = entry["bvid"]
+        run_download(job, link, entry["title"], batch.opts)
+        return job
+
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, 4))) as pool:
+            list(pool.map(one, batch.entries))
+    finally:
+        with batch._lock:
+            batch.state = "done"
+            batch.finished = time.time()
+        # 跑完清一下历史，别让内存一直涨
+        with BATCH_LOCK:
+            if len(BATCHES) > 20:
+                for k in sorted(BATCHES, key=lambda x: BATCHES[x].created)[:10]:
+                    if BATCHES[k].finished:
+                        BATCHES.pop(k, None)
 
 
 # ============================================================================
@@ -405,6 +476,47 @@ def page_html():
           line-height:1;font-size:6px;letter-spacing:0;margin:0}
   .qr .tip{color:var(--dim);font-size:12px;margin-top:10px}
   .hint{color:var(--dim);font-size:12px;margin-top:8px}
+
+  /* 附加选项：勾选框排成一行，窄屏自动换行 */
+  .opts{display:flex;gap:14px;flex-wrap:wrap;margin-top:12px;align-items:center}
+  .opts label{display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);
+              font-size:13px;cursor:pointer;user-select:none}
+  .opts input[type=checkbox]{width:15px;height:15px;accent-color:var(--acc);cursor:pointer}
+
+  /* 收藏夹 */
+  .favbar{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  .favbar>div:first-child{flex:1;min-width:200px}
+  .favlist{max-height:340px;overflow-y:auto;margin-top:14px;
+           border:1px solid #2b3542;border-radius:8px;background:var(--bg)}
+  .favlist:empty{display:none}
+  .fav{display:flex;align-items:center;gap:10px;padding:8px 12px;
+       border-bottom:1px solid #232b35;font-size:13px}
+  .fav:last-child{border-bottom:0}
+  .fav:hover{background:var(--bg3)}
+  .fav input[type=checkbox]{width:15px;height:15px;accent-color:var(--acc);
+                            cursor:pointer;flex-shrink:0}
+  .fav .idx{color:var(--dim);font-size:11px;width:38px;flex-shrink:0;
+            text-align:right;font-variant-numeric:tabular-nums}
+  .fav .tt{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .fav .dl{padding:3px 10px;font-size:12px;background:transparent;
+           border:1px solid #2b3542;color:var(--dim);flex-shrink:0}
+  .fav .dl:hover{background:var(--bg3);color:var(--acc);border-color:var(--acc)}
+  .fav.picked{background:rgba(78,201,176,.07)}
+
+  /* 批量进度 */
+  .bt{margin-top:12px;padding:12px;background:var(--bg);border-radius:8px;
+      border:1px solid #2b3542}
+  .bt .hd{display:flex;justify-content:space-between;font-size:12px;
+          color:var(--dim);margin-bottom:8px}
+  .bt .bd{max-height:220px;overflow-y:auto;font-size:12px}
+  .bt .it{display:flex;gap:8px;padding:4px 0;align-items:baseline}
+  .bt .it .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .bt .it .ps{color:var(--dim);flex-shrink:0;font-variant-numeric:tabular-nums}
+  .bt .it.ok .ps{color:var(--ok)}
+  .bt .it.no .ps{color:var(--err)}
+  .spin{display:inline-block;width:8px;height:8px;border-radius:50%;
+        background:var(--acc);animation:pl 1s infinite}
+  @keyframes pl{0%,100%{opacity:.25}50%{opacity:1}}
 </style>
 </head>
 <body>
@@ -427,6 +539,27 @@ def page_html():
         <label>清晰度</label>
         <select id="qn"><option value="">自动（取账号可用的最高档）</option></select>
       </div>
+      <div>
+        <label>命名模板</label>
+        <input type="text" id="tpl" value="{up}/{date} {title}"
+               placeholder="{up}/{date} {title}" autocomplete="off">
+      </div>
+    </div>
+
+    <div class="opts">
+      <label><input type="checkbox" id="opt_sub"> 字幕（有则存 .srt）</label>
+      <label><input type="checkbox" id="opt_dm"> 弹幕（存 .xml 和 .ass）</label>
+      <label><input type="checkbox" id="opt_cover"> 封面</label>
+      <label><input type="checkbox" id="opt_meta"> 元数据</label>
+      <label><input type="checkbox" id="opt_audio"> 仅音频</label>
+      <label><input type="checkbox" id="opt_parts"> 多分P 全下</label>
+    </div>
+    <div class="hint">
+      模板可用字段：{title} {bvid} {aid} {up} {date} {p} {part} {quality} {duration}。
+      空着就按 {up}/{date} {title} 存。多分P 视频默认只下第 1 个分P，勾上「多分P 全下」才会全取。
+    </div>
+
+    <div class="row">
       <div style="display:flex;align-items:flex-end">
         <button class="primary" id="go" style="width:100%">解析并下载</button>
       </div>
@@ -443,6 +576,29 @@ def page_html():
       <pre id="qrart"></pre>
       <div class="tip">用哔哩哔哩手机客户端扫码</div>
     </div>
+  </div>
+
+  <div class="card">
+    <label style="margin-bottom:10px">账号收藏夹</label>
+    <div class="favbar">
+      <div>
+        <label>选择收藏夹</label>
+        <select id="folder"><option value="">— 先登录，再点「载入收藏夹」 —</option></select>
+      </div>
+      <div><button id="fload">载入收藏夹</button></div>
+      <div><button id="fdl">下载选中</button></div>
+    </div>
+    <div class="hint" id="favstate">
+      需要先扫码登录。载入后可以勾选单个视频单独下载，也可以全选后一次性批量下载。
+      附加选项与上面那张卡片共用。
+    </div>
+    <div class="favlist" id="favlist"></div>
+    <div class="row" id="favacts" style="display:none">
+      <div style="flex:0 0 auto"><button id="fall">全选</button></div>
+      <div style="flex:0 0 auto"><button id="fnone">清空</button></div>
+      <div style="flex:0 0 auto"><button id="finv">反选</button></div>
+    </div>
+    <div id="btbox" style="display:none"></div>
   </div>
 
   <div class="card">
@@ -480,6 +636,39 @@ async function jget(path){
   return await r.json();
 }
 
+// 标题、作者名这些都来自 B 站，是不可信输入。
+// 页面用 innerHTML 拼字符串，不转义的话标题里一个 < 就能把版面拆掉。
+function esc(s){
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// 两处下载入口共用同一组附加选项
+function getOpts(){
+  return {
+    template: $('tpl').value.trim() || '{title}',
+    subtitle: $('opt_sub').checked,
+    danmaku:  $('opt_dm').checked,
+    cover:    $('opt_cover').checked,
+    metadata: $('opt_meta').checked,
+    audio_only: $('opt_audio').checked,
+    all_parts: $('opt_parts').checked
+  };
+}
+
+// 用配置文件里的值填表单，让网页版和命令行版共用同一份设置
+function applyCfg(c){
+  if(!c) return;
+  if(c.template) $('tpl').value = c.template;
+  $('opt_sub').checked   = !!c.subtitle;
+  $('opt_dm').checked    = !!c.danmaku;
+  $('opt_cover').checked = !!c.cover;
+  $('opt_meta').checked  = !!c.metadata;
+  $('opt_audio').checked = !!c.audio_only;
+  $('opt_parts').checked = !!c.all_parts;
+}
+
 // ---- 登录状态 ----
 async function loadLogin(){
   try{
@@ -512,17 +701,16 @@ async function loadJobs(){
     box.innerHTML = d.jobs.map(j => {
       let action = '';
       if(j.state === 'done' && j.path){
-        const nm = j.path.split(/[\\\\/]/).pop();
-        action = ' <a href="/download?id=' + j.id + '">下载文件</a>';
+        action = ' <a href="/download?id=' + encodeURIComponent(j.id) + '">下载文件</a>';
       }
       let st = j.state;
       if(j.state === 'running') st = '下载中 ' + j.pct + '%';
       else if(j.state === 'done') st = '已完成';
       else if(j.state === 'error') st = '失败';
       const err = (j.state === 'error' && j.error)
-        ? '<div class="st" style="color:var(--err)">' + j.error + '</div>' : '';
+        ? '<div class="st" style="color:var(--err)">' + esc(j.error) + '</div>' : '';
       return '<div class="job"><div class="n"><span class="name">' +
-        j.title + '</span><span class="st">' + st + action + '</span></div>' + err + '</div>';
+        esc(j.title) + '</span><span class="st">' + esc(st) + action + '</span></div>' + err + '</div>';
     }).join('');
   }catch(e){}
 }
@@ -568,10 +756,11 @@ $('go').onclick = async () => {
 
   let d;
   try{
+    const body = Object.assign({url: url, qn: $('qn').value || null}, getOpts());
     const r = await fetch('/api/prepare', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({url: url, qn: $('qn').value || null})
+      body: JSON.stringify(body)
     });
     d = await r.json();
   }catch(e){
@@ -583,11 +772,11 @@ $('go').onclick = async () => {
   fillQuality(d.accept);
   $('info').style.display = 'block';
   $('info').innerHTML =
-    '<div class="t">' + d.title + '</div>' +
-    '<div class="meta"><span>作者　' + d.owner + '</span>' +
-    '<span>时长　' + fmtDur(d.duration) + '</span>' +
-    '<span>清晰度　' + d.quality + '</span>' +
-    '<span>' + d.kind + '</span></div>';
+    '<div class="t">' + esc(d.title) + '</div>' +
+    '<div class="meta"><span>作者　' + esc(d.owner) + '</span>' +
+    '<span>时长　' + esc(fmtDur(d.duration)) + '</span>' +
+    '<span>清晰度　' + esc(d.quality) + '</span>' +
+    '<span>' + esc(d.kind) + '</span></div>';
 
   if(d.warn) showMsg(d.warn, 'warn'); else showMsg('开始下载…', 'ok');
   startPoll(d.job);
@@ -626,6 +815,221 @@ $('login').onclick = async () => {
   }, 1500);
 };
 
+// ===================== 收藏夹 =====================
+let favFolders = [], favVideos = [], favLimit = 300, btTimer = null, btId = null;
+
+function pickedCount(){
+  return document.querySelectorAll('#favlist .ck:checked').length;
+}
+
+function loadFolders(){
+  return jget('/api/fav/folders').then(d => {
+    if(d.error){ $('favstate').textContent = d.error; return false; }
+    favFolders = d.folders || [];
+    if(!favFolders.length){
+      $('favstate').textContent = '这个账号还没有收藏夹。';
+      return false;
+    }
+    // 记住当前选中项，刷新后不要跳回第一个
+    const keep = $('folder').value;
+    $('folder').innerHTML = favFolders.map(f =>
+      '<option value="' + esc(f.id) + '">' + esc(f.title) + '（' + f.count + ' 个）</option>'
+    ).join('');
+    if(keep && favFolders.some(f => String(f.id) === keep)) $('folder').value = keep;
+    return true;
+  });
+}
+
+function loadVideos(limit){
+  const id = $('folder').value;
+  if(!id){ $('favstate').textContent = '先点「载入收藏夹」，或从下拉框里选一个。'; return; }
+  $('fload').disabled = true;
+  $('fdl').disabled = true;
+  $('favstate').textContent = '正在读取，收藏夹大的话要翻很多页…';
+  return jget('/api/fav/videos?id=' + encodeURIComponent(id) + '&limit=' + limit)
+    .then(d => {
+      if(d.error){ $('favstate').textContent = d.error; return; }
+      favVideos = d.videos || [];
+      favLimit = limit;
+      renderFavs();
+    })
+    .catch(e => { $('favstate').textContent = '读取失败：' + e; })
+    .then(() => { $('fload').disabled = false; $('fdl').disabled = false; });
+}
+
+function renderFavs(){
+  const box = $('favlist');
+  if(!favVideos.length){
+    box.innerHTML = '';
+    $('favacts').style.display = 'none';
+    $('favstate').textContent = '这个收藏夹是空的，或者里面的稿件都已失效。';
+    return;
+  }
+  box.innerHTML = favVideos.map((v, i) => {
+    const np = (v.parts || 1) > 1
+      ? ' <span style="color:var(--warn)">共' + v.parts + 'P</span>' : '';
+    return '<div class="fav" data-i="' + i + '">' +
+      '<input type="checkbox" class="ck">' +
+      '<span class="idx">' + (i + 1) + '</span>' +
+      '<span class="tt" title="' + esc(v.title) + '">' + esc(v.title) + np + '</span>' +
+      '<button class="dl" title="只下载这一个">下载</button>' +
+      '</div>';
+  }).join('');
+  $('favacts').style.display = 'flex';
+
+  const f = favFolders.find(x => String(x.id) === $('folder').value);
+  const total = f ? f.count : favVideos.length;
+  let s = '已载入 <b>' + favVideos.length + '</b> 个';
+  if(total > favVideos.length){
+    s += '（该收藏夹共 ' + total + ' 个，<a href="#" id="morelink">继续载入更多</a>）';
+  } else {
+    s += '（全部）';
+  }
+  s += '。勾选后点「下载选中」批量下，或点某一行的「下载」只下那一个。';
+  $('favstate').innerHTML = s;
+
+  const ml = $('morelink');
+  if(ml) ml.onclick = e => { e.preventDefault(); loadVideos(Math.min(favLimit * 2, 2000)); };
+}
+
+function syncPick(){
+  const n = pickedCount();
+  $('fdl').textContent = n ? ('下载选中（' + n + '）') : '下载选中';
+  $('fdl').className = n ? 'primary' : '';
+}
+
+$('favlist').addEventListener('click', e => {
+  const row = e.target.closest('.fav');
+  if(!row) return;
+  const i = parseInt(row.dataset.i, 10);
+
+  if(e.target.classList.contains('dl')){
+    startFav([i]);
+    return;
+  }
+  const ck = row.querySelector('.ck');
+  // 点复选框本身时浏览器已经翻转过了，别再翻一次
+  if(e.target !== ck) ck.checked = !ck.checked;
+  row.classList.toggle('picked', ck.checked);
+  syncPick();
+});
+
+$('fall').onclick = () => {
+  document.querySelectorAll('#favlist .fav').forEach(r => {
+    r.querySelector('.ck').checked = true;
+    r.classList.add('picked');
+  });
+  syncPick();
+};
+$('fnone').onclick = () => {
+  document.querySelectorAll('#favlist .fav').forEach(r => {
+    r.querySelector('.ck').checked = false;
+    r.classList.remove('picked');
+  });
+  syncPick();
+};
+$('finv').onclick = () => {
+  document.querySelectorAll('#favlist .fav').forEach(r => {
+    const ck = r.querySelector('.ck');
+    ck.checked = !ck.checked;
+    r.classList.toggle('picked', ck.checked);
+  });
+  syncPick();
+};
+
+// 只下某一行时不必先勾选，直接传下标
+function startFav(indexes){
+  const picks = (indexes && indexes.length
+    ? indexes.map(i => favVideos[i])
+    : Array.from(document.querySelectorAll('#favlist .fav'))
+        .filter(r => r.querySelector('.ck').checked)
+        .map(r => favVideos[parseInt(r.dataset.i, 10)])
+  ).filter(Boolean);
+
+  if(!picks.length){ showMsg('还没勾选任何视频。', 'warn'); return; }
+
+  const bvids = picks.map(v => v.bvid);
+  const titles = {}, parts = {};
+  picks.forEach(v => { titles[v.bvid] = v.title; parts[v.bvid] = v.parts || 1; });
+
+  const f = favFolders.find(x => String(x.id) === $('folder').value);
+  const body = Object.assign({
+    bvids: bvids, titles: titles, parts: parts,
+    name: f ? f.title : '收藏夹',
+    qn: $('qn').value || null
+  }, getOpts());
+
+  $('fdl').disabled = true;
+  hideMsg();
+
+  fetch('/api/fav/download', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  })
+  .then(r => r.json())
+  .then(d => {
+    if(d.error){ showMsg(d.error, 'err'); return; }
+    showMsg('已加入队列：' + d.total + ' 个，正在后台下载。', 'ok');
+    btId = d.batch;
+    pollBatch();
+  })
+  .catch(e => showMsg('提交失败：' + e, 'err'))
+  .then(() => { $('fdl').disabled = false; });
+}
+
+function pollBatch(){
+  if(btTimer) clearInterval(btTimer);
+  $('btbox').style.display = 'block';
+  btTimer = setInterval(async () => {
+    let b;
+    try{ b = await jget('/api/batch?id=' + encodeURIComponent(btId)); }
+    catch(e){ return; }
+    if(b.error){ clearInterval(btTimer); btTimer = null; $('btbox').innerHTML = ''; return; }
+
+    const items = b.items.map(it => {
+      let cls = '', ps = it.state;
+      if(it.state === 'running'){ ps = '<span class="spin"></span> ' + it.pct + '%'; }
+      else if(it.state === 'done'){
+        cls = 'ok';
+        ps = it.path
+          ? '<a href="/download?id=' + encodeURIComponent(it.job) + '">保存</a>'
+          : '完成';
+      }
+      else if(it.state === 'error'){ cls = 'no'; ps = '失败'; }
+      else if(it.state === 'pending'){ ps = '排队中'; }
+      const np = (it.parts || 1) > 1 ? ' [共' + it.parts + 'P]' : '';
+      return '<div class="it ' + cls + '"><span class="nm" title="' + esc(it.title) + '">' +
+             esc(it.title) + np + '</span><span class="ps">' + ps + '</span></div>';
+    }).join('');
+
+    $('btbox').innerHTML =
+      '<div class="bt">' +
+        '<div class="hd"><span>' + esc(b.name) + '　' + b.done + ' / ' + b.total +
+        (b.failed ? '，失败 ' + b.failed : '') + '</span>' +
+        '<span>' + (b.state === 'done' ? '全部结束' : b.pct + '%') + '</span></div>' +
+        '<div class="bar"><i style="width:' + b.pct + '%"></i></div>' +
+        '<div class="bd">' + items + '</div>' +
+      '</div>';
+
+    if(b.state === 'done'){
+      clearInterval(btTimer); btTimer = null;
+      showMsg(b.failed ? ('批量完成，' + b.failed + ' 个失败，可在下载记录里重试。')
+                       : '批量下载完成。', b.failed ? 'warn' : 'ok');
+      loadJobs();
+    }
+  }, 900);
+}
+
+$('fload').onclick = () => {
+  hideMsg();
+  // 第一次点：没有收藏夹列表就先取列表，再读第一个收藏夹的内容
+  const go = favFolders.length ? Promise.resolve(true) : loadFolders();
+  go.then(ok => { if(ok) loadVideos(300); });
+};
+$('folder').onchange = () => { if(favFolders.length) loadVideos(300); };
+$('fdl').onclick = () => startFav(null);
+
 $('logout').onclick = async () => {
   await fetch('/api/logout', {method:'POST'});
   showMsg('已清除本机保存的登录凭证', 'ok');
@@ -636,6 +1040,7 @@ $('refresh').onclick = loadJobs;
 $('url').addEventListener('keydown', e => { if(e.key === 'Enter') $('go').click(); });
 
 fillQuality(__ACCEPT__);
+applyCfg(__CFG__);
 loadLogin();
 loadJobs();
 </script>
@@ -644,13 +1049,20 @@ loadJobs();
 """
 
 
-def render_page(accept_qualities):
-    """把动态部分填进模板。用简单替换而不是格式化，避免和 CSS 里的花括号冲突"""
+def render_page(accept_qualities, cfg=None):
+    """
+    把动态部分填进模板。
+
+    用简单替换而不是 str.format，因为 CSS 里全是花括号。
+    cfg 是配置文件内容，交给前端把默认值填进表单 ——
+    这样网页版和命令行版共享同一份设置，不用维护两套默认值
+    """
     qnames = {str(k): v for k, v in core.QUALITY_NAME.items()}
     return (page_html()
             .replace("__TITLE__", html.escape(APP_TITLE))
             .replace("__QNAMES__", json.dumps(qnames, ensure_ascii=False))
-            .replace("__ACCEPT__", json.dumps(sorted(accept_qualities, reverse=True))))
+            .replace("__ACCEPT__", json.dumps(sorted(accept_qualities, reverse=True)))
+            .replace("__CFG__", json.dumps(cfg or {}, ensure_ascii=False)))
 
 
 # ============================================================================
@@ -677,6 +1089,10 @@ class Handler(BaseHTTPRequestHandler):
             msg = fmt % a
         except Exception:
             msg = str(fmt)
+        # 浏览器每次开页面都会自己来要图标，我们不提供，
+        # 这个 404 跟程序状态无关，记下来纯属噪音
+        if "favicon.ico" in msg:
+            return
         # 成功响应不记
         if '" 2' in msg or '" 3' in msg:
             if self.command == "GET":
@@ -765,7 +1181,16 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path in ("/", "/index.html"):
-            self._html(render_page(list(core.QUALITY_NAME.keys())))
+            self._html(render_page(list(core.QUALITY_NAME.keys()),
+                                   getattr(self.server, "cfg", None)))
+            return
+
+        # 浏览器会自己来要图标。不提供内容但也别回 404 ——
+        # 回 404 只会在控制台留一行没用的记录
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
 
         if path == "/api/login":
@@ -800,6 +1225,25 @@ class Handler(BaseHTTPRequestHandler):
             self._qr_poll()
             return
 
+        if path == "/api/fav/folders":
+            self._fav_folders()
+            return
+
+        if path == "/api/fav/videos":
+            self._fav_videos()
+            return
+
+        if path == "/api/batch":
+            q = parse_qs(urlparse(self.path).query)
+            bid = (q.get("id") or [""])[0]
+            with BATCH_LOCK:
+                b = BATCHES.get(bid)
+            if not b:
+                self._json({"error": "批次不存在"}, 404)
+                return
+            self._json(b.snapshot())
+            return
+
         if path == "/download":
             self._serve_file()
             return
@@ -825,9 +1269,151 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
             return
 
+        if path == "/api/fav/download":
+            self._fav_download()
+            return
+
         self._json({"error": "not found"}, 404)
 
+    # ---- 收藏夹接口 ----
+    def _fav_folders(self):
+        """列出账号的收藏夹"""
+        try:
+            import bili_fav
+        except ImportError:
+            self._json({"error": "缺少 bili_fav.py"})
+            return
+        try:
+            folders, e = bili_fav.list_folders(core.Bili())
+        except Exception as ex:
+            self._json({"error": "读取收藏夹出错：%s" % ex})
+            return
+        if e:
+            self._json({"error": e})
+            return
+        self._json({"folders": [
+            {"id": f["id"], "title": f["title"], "count": f["count"]}
+            for f in folders
+        ]})
+
+    def _fav_videos(self):
+        """
+        列出某个收藏夹里的视频。
+
+        大收藏夹（实测见过两千多个）全取会很慢，
+        所以前端要传 limit，默认也设个上限。
+        """
+        q = parse_qs(urlparse(self.path).query)
+        mid = (q.get("id") or [""])[0]
+        try:
+            limit = int((q.get("limit") or ["300"])[0])
+        except Exception:
+            limit = 300
+        limit = max(1, min(limit, 2000))
+
+        if not mid.isdigit():
+            self._json({"error": "收藏夹 ID 不对"})
+            return
+        try:
+            import bili_fav
+        except ImportError:
+            self._json({"error": "缺少 bili_fav.py"})
+            return
+        try:
+            videos, e = bili_fav.fetch_folder(core.Bili(), int(mid), limit=limit)
+        except Exception as ex:
+            self._json({"error": "读取失败：%s" % ex})
+            return
+        if e:
+            self._json({"error": e})
+            return
+        self._json({"videos": videos, "count": len(videos)})
+
+    def _fav_download(self):
+        """
+        批量下载收藏夹里选中的视频。
+
+        前端传一列 bvid，可以是一个也可以是几百个 ——
+        这就是"批量下载"和"单独下载"两种用法的统一入口：
+        选一个就是单独下，全选就是批量下。
+        """
+        data = self._read_json()
+        if isinstance(data, tuple):
+            data, too_big = data
+            if too_big:
+                self._json({"error": "请求体过大"}, 413)
+                return
+
+        bvids = data.get("bvids") or []
+        if not isinstance(bvids, list) or not bvids:
+            self._json({"error": "没有选中任何视频"})
+            return
+        bvids = [str(b) for b in bvids][:500]      # 一次最多 500 个
+
+        # 标题和分P 数由前端带过来，省掉服务端为了拿这两样再请求一遍。
+        # parts 用于显示"共几P"，不参与分P 选择 —— 收藏夹接口给不出"第几P"
+        titles = data.get("titles") or {}
+        parts = data.get("parts") or {}
+        items = []
+        for b in bvids:
+            if not re.match(r"^BV[0-9A-Za-z]{10}$", b):
+                continue
+            try:
+                n = max(1, int(parts.get(b) or 1))
+            except Exception:
+                n = 1
+            items.append({
+                "bvid": b,
+                "title": (titles.get(b) or b)[:200],
+                "parts": n,
+            })
+        if not items:
+            self._json({"error": "没有有效的视频编号"})
+            return
+
+        opts = self._extract_opts(data)
+        qn = data.get("qn")
+        try:
+            qn = int(qn) if qn not in (None, "", "null") else None
+        except Exception:
+            qn = None
+
+        batch = Batch(data.get("name") or "收藏夹", items,
+                      self.server.outdir, qn, opts)
+        with BATCH_LOCK:
+            BATCHES[batch.id] = batch
+
+        workers = int(self.server.concurrency or 2)
+        threading.Thread(target=run_batch, args=(batch, workers),
+                         daemon=True).start()
+
+        self._json({"batch": batch.id, "total": len(items)})
+
     # ---- 各接口实现 ----
+    def _extract_opts(self, data):
+        """
+        从请求里取出附加选项。
+
+        只认白名单里的键，其它一律忽略 —— 请求体是外部输入，
+        不能让它直接决定程序行为。模板字符串也做长度限制，
+        免得被塞进来一个超长路径。
+        """
+        tpl = (data.get("template") or "{title}").strip()
+        if len(tpl) > 200:
+            tpl = tpl[:200]
+        return {
+            "template": tpl or "{title}",
+            "subtitle": bool(data.get("subtitle")),
+            "danmaku": bool(data.get("danmaku")),
+            "cover": bool(data.get("cover")),
+            "metadata": bool(data.get("metadata")),
+            "audio_only": bool(data.get("audio_only")),
+            "audio_mp3": bool(data.get("audio_mp3")),
+            # 多分P 视频是否每个分P 都下。单视频走 /api/prepare，那里按链接里的
+            # ?p= 或第 1 个分P 处理；这个开关主要给收藏夹批量用
+            "all_parts": bool(data.get("all_parts")),
+        }
+
     def _prepare(self):
         """
         解析链接并启动下载任务。
@@ -920,8 +1506,13 @@ class Handler(BaseHTTPRequestHandler):
         job = JOBS.create(url, title, self.server.outdir, qn)
         job.set(message="准备中", total_bytes=0)
 
+        # 网页也能带上附加选项：字幕、弹幕、仅音频等
+        opts = self._extract_opts(data)
+        link = info.get("bvid") or bvid
+        if idx > 0:
+            link = "%s?p=%d" % (link, idx + 1)
         t = threading.Thread(target=run_download,
-                             args=(job, info.get("bvid") or bvid, cid, title),
+                             args=(job, link, title, opts),
                              daemon=True)
         t.start()
 
@@ -998,6 +1589,26 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json({"state": "waiting", "error": str(e)})
 
+    def _find_job(self, jid):
+        """
+        按任务号找任务。
+
+        单视频任务在 JOBS 里，收藏夹批量的每一项只在所属 Batch 里。
+        批量如果是几百个，全塞进"下载记录"会把那一栏冲垮，
+        所以它们不进 JOBS，但产物链接仍然要能点开，于是这里再翻一遍批次
+        """
+        if not jid:
+            return None
+        job = JOBS.get(jid)
+        if job is not None:
+            return job
+        with BATCH_LOCK:
+            for b in BATCHES.values():
+                for e in b.entries:
+                    if e["job"].id == jid:
+                        return e["job"]
+        return None
+
     def _serve_file(self):
         """
         把下载好的文件发给浏览器。
@@ -1007,7 +1618,7 @@ class Handler(BaseHTTPRequestHandler):
         否则就是一个任意文件读取漏洞
         """
         q = parse_qs(urlparse(self.path).query)
-        job = JOBS.get((q.get("id") or [""])[0])
+        job = self._find_job((q.get("id") or [""])[0])
 
         if not job or job.state != "done" or not job.path:
             self._json({"error": "文件不存在或尚未下载完成"}, 404)
@@ -1056,7 +1667,9 @@ class Handler(BaseHTTPRequestHandler):
 
         length = end - start + 1
         self.send_response(206 if partial else 200)
-        self.send_header("Content-Type", "video/mp4")
+        # 不能一律写 video/mp4：开了"仅音频"产物是 .m4a，勾了字幕还可能是 .srt。
+        # 类型写错浏览器会拿错误的程序打开
+        self.send_header("Content-Type", guess_mime(name))
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Disposition", disp)
@@ -1082,6 +1695,68 @@ class Handler(BaseHTTPRequestHandler):
 # ============================================================================
 #  启动
 # ============================================================================
+# 扩展名 -> MIME。只列这个工具自己会产出的类型，够了。
+# 查不到的用 application/octet-stream 兜底，浏览器会当附件处理
+MIME_MAP = {
+    ".mp4": "video/mp4",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".flv": "video/x-flv",
+    ".srt": "application/x-subrip",
+    ".ass": "text/x-ssa",
+    ".xml": "application/xml",
+    ".json": "application/json",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+
+def guess_mime(name):
+    return MIME_MAP.get(os.path.splitext(name)[1].lower(),
+                        "application/octet-stream")
+
+
+class Server(ThreadingHTTPServer):
+    """
+    HTTP 服务本体。
+
+    单独建一个类是为了三件事：
+      · 把下载目录、并发数这些配置挂成正式属性，而不是临时 setattr
+      · 关掉 block_on_close —— 见下面说明
+      · 过滤掉客户端主动断开造成的假异常
+    """
+
+    daemon_threads = True
+
+    # 默认实现会在 server_close() 时 join 所有请求线程。
+    # 可请求线程里可能正跑着一个几百 MB 的下载，于是 Ctrl+C 之后
+    # 进程要等它下完才退，用户看到的是"按了没反应"。
+    # 关掉之后立即返回，进程靠 daemon 线程随主线程一起结束
+    block_on_close = False
+
+    # 这三个属性在 main() 里赋值
+    outdir = None
+    cfg = None
+    concurrency = 2
+
+    def handle_error(self, request, client_address):
+        """
+        请求线程里的未捕获异常。
+
+        父类的默认实现会把完整调用栈打到终端。但最常见的两种情况
+        根本不是程序错误：浏览器提前关掉请求（刷页面、切换收藏夹时
+        频繁中断）会抛 ConnectionResetError / BrokenPipeError。
+        这类噪音会盖掉真正的异常，所以单独放过去。
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError,
+                            ConnectionAbortedError, TimeoutError)):
+            return
+        ThreadingHTTPServer.handle_error(self, request, client_address)
+
+
 def pick_port(preferred):
     """
     找一个能用的端口。
@@ -1108,12 +1783,21 @@ def main():
     ap.add_argument("--port", type=int, default=8848, help="监听端口，默认 8848")
     ap.add_argument("--out", default=None, help="下载目录，默认与命令行版相同")
     ap.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    ap.add_argument("--jobs", type=int, default=None,
+                    help="收藏夹批量下载时的并发数，默认取配置文件里的值，最大 4")
     ap.add_argument("--host", default="127.0.0.1",
                     help="监听地址，默认只监听本机。改成 0.0.0.0 会让同网段其他设备也能访问，"
                          "请确认你了解风险后再改")
     args = ap.parse_args()
 
-    outdir = args.out or core.DEFAULT_OUTDIR
+    # 服务进程里一切都在后台线程中发生，没有"等用户回答"这回事。
+    # 不声明的话，多P 视频的下载线程会停下来等终端输入
+    core.set_interactive(False)
+    core.set_assume_yes(True)
+
+    # 网页版和命令行版共用 ~/.bili_dl.json，不另立一套设置
+    cfg = core.load_config()
+    outdir = args.out or cfg.get("outdir") or core.DEFAULT_OUTDIR
     try:
         os.makedirs(outdir, exist_ok=True)
     except Exception as e:
@@ -1125,8 +1809,14 @@ def main():
         print("端口 %d 起连续 20 个都被占用，请用 --port 指定其他端口。" % args.port)
         return 2
 
-    httpd = ThreadingHTTPServer((args.host, port), Handler)
+    httpd = Server((args.host, port), Handler)
     httpd.outdir = outdir
+    httpd.cfg = cfg
+    # 收藏夹批量下载的并发数。挂在 server 上是为了让 --jobs 能改，
+    # 默认跟命令行版共用配置里的 concurrency（默认 3），压到 4 以内：
+    # 网页通常一边下一边看进度，并发太高反而互相抢带宽
+    jobs = args.jobs if args.jobs is not None else (cfg.get("concurrency") or 2)
+    httpd.concurrency = max(1, min(int(jobs), 4))
     url = "http://127.0.0.1:%d/" % port
 
     print()
@@ -1135,6 +1825,7 @@ def main():
     print("=" * 70)
     print("  地址      %s" % url)
     print("  下载目录  %s" % outdir)
+    print("  批量并发  %d" % httpd.concurrency)
     if args.port != port:
         print("  注意      端口 %d 被占用，已改用 %d" % (args.port, port))
     if args.host != "127.0.0.1":
