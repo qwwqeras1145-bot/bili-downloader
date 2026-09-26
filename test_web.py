@@ -548,6 +548,92 @@ def test_online(mod, srv):
             check(c2 == 200, "能从网页取回文件")
             check(len(b2) == os.path.getsize(path), "取回内容长度一致")
 
+    test_online_ugc(srv)
+
+
+def test_online_ugc(srv):
+    """
+    合集接口的联网验证。
+
+    用真实的公开合集做样本，不 mock。选的是"罗翔说刑法"（mid 517327498），
+    他既有合集也有系列，两种接口都能覆盖到。
+
+    只验"接口能通、字段能用"，不验具体有多少集 —— 那个随时会变，
+    写死数字只会让测试过几天自己红掉。
+    """
+    print()
+    print("=" * 72)
+    print("测试组 10  合集与系列（联网）")
+    print("=" * 72)
+
+    # 1. 给 UP 的 mid，应列出全部合集与系列
+    code, _, body = srv.get("/api/ugc/resolve?q=517327498", timeout=60)
+    check(code == 200, "resolve 返回 200")
+    d = json.loads(body)
+    if d.get("error"):
+        check(False, "列出某个 UP 的合集", d["error"])
+        return
+    cols = d.get("collections") or []
+    check(len(cols) > 0, "列出 %d 个合集或系列" % len(cols))
+    kinds = set(c.get("kind") for c in cols)
+    check(kinds <= {"season", "series"}, "kind 取值合法", str(kinds))
+    for c in cols[:3]:
+        check(bool(c.get("id")) and bool(c.get("title")),
+              "每项都有 id 和标题: %s" % c.get("title"))
+    print("      例子: " + "、".join(c["title"] for c in cols[:3]))
+
+    season = next((c for c in cols if c["kind"] == "season"), None)
+    series = next((c for c in cols if c["kind"] == "series"), None)
+
+    # 2. 合集里的视频
+    if season:
+        code, _, body = srv.get(
+            "/api/ugc/videos?mid=517327498&kind=season&id=%s&limit=5"
+            % season["id"], timeout=90)
+        check(code == 200, "取合集视频返回 200")
+        v = json.loads(body)
+        if v.get("error"):
+            check(False, "取合集里的视频", v["error"])
+        else:
+            check(v.get("count", 0) > 0,
+                  "合集「%s」取到 %d 条" % (season["title"], v.get("count", 0)))
+            if v.get("videos"):
+                one = v["videos"][0]
+                check(one.get("bvid", "").startswith("BV"),
+                      "视频编号正常: %s" % one.get("bvid"))
+                check(bool(one.get("title")), "视频有标题")
+                # 响应裁剪过，不该把播放量那些一起带回来
+                check("stat" not in one, "响应里没有冗余的统计字段")
+
+    # 3. 系列走的是另一套接口，字段名都不一样，单独验一次
+    if series:
+        code, _, body = srv.get(
+            "/api/ugc/videos?mid=517327498&kind=series&id=%s&limit=5"
+            % series["id"], timeout=90)
+        check(code == 200, "取系列视频返回 200")
+        v = json.loads(body)
+        if v.get("error"):
+            check(False, "取系列里的视频", v["error"])
+        else:
+            check(v.get("count", 0) > 0,
+                  "系列「%s」取到 %d 条" % (series["title"], v.get("count", 0)))
+
+    # 4. 给视频链接，应直接找出它所属的合集
+    code, _, body = srv.get("/api/ugc/resolve?q=BV1kv4y1L7EC", timeout=90)
+    check(code == 200, "从视频找合集返回 200")
+    d = json.loads(body)
+    if d.get("error"):
+        check(False, "从视频找它所属的合集", d["error"])
+    elif d.get("videos"):
+        check(bool((d.get("collection") or {}).get("title")),
+              "找到了合集：%s" % d["collection"]["title"])
+        check(len(d["videos"]) > 1,
+              "一次就拿到了全集 %d 条" % len(d["videos"]))
+        check(all(v.get("bvid") for v in d["videos"]), "每条都有编号")
+    else:
+        # 这个视频哪天被移出合集也算正常，退一步要求至少给出了作者
+        check(bool(d.get("mid")), "视频不在合集里时给出了作者 mid", str(d)[:80])
+
 
 # ============================================================================
 def main():

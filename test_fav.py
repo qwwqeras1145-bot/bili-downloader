@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-收藏夹、命名模板、附加内容相关的离线测试
+收藏夹、合集、命名模板、附加内容相关的离线测试
 
 这些都是不需要联网就能验证的部分：解析、路径拼装、选项白名单、
-状态机、并发开关的语义。真正要联网的东西（取收藏夹、下视频）
-放在 test_web.py --online 和 test_web_browser.py 里。
+状态机、并发开关的语义、分节切分的边界。真正要联网的东西
+（取收藏夹、取合集、下视频）放在 test_web.py --online 和
+test_web_browser.py 里。
 
 跑法
     python test_fav.py
@@ -603,14 +604,208 @@ def test_concurrency():
     check("max(1, min(n, 8))" in src, "命令行并发压在 8 以内")
 
 
+# ============================================================================
+#  十三、合集：入口解析
+# ============================================================================
+def test_ugc_mid():
+    group("测试组 13  合集入口解析")
+
+    import bili_ugc as ugc
+
+    check(ugc.parse_mid("27500557") == (27500557, ""), "纯数字当 mid")
+    check(ugc.parse_mid(" 27500557 ") == (27500557, ""), "两边空格不影响")
+    check(ugc.parse_mid("https://space.bilibili.com/27500557")[0] == 27500557,
+          "空间链接取出 mid")
+    check(ugc.parse_mid("https://space.bilibili.com/27500557/video")[0] == 27500557,
+          "空间链接带子路径也能取")
+    check(ugc.parse_mid("http://space.bilibili.com/1/dynamic")[0] == 1,
+          "http 也认")
+
+    # 视频链接：mid 要联网才知道，这里只要求"不报错、mid 为空"
+    for s in ("BV1iDz3BxEYS", "https://www.bilibili.com/video/BV1iDz3BxEYS",
+              "av12345"):
+        mid, e = ugc.parse_mid(s)
+        check(mid is None and e == "",
+              "视频写法交给联网那步：%s" % s[:36])
+
+    # 短链要先跟一次跳转。跟不动（比如这是个假的短链）时
+    # 不能崩，也不能静默当成成功 —— 要给一句能看懂的话
+    mid, e = ugc.parse_mid("https://b23.tv/xxxxxxx")
+    check(mid is None, "短链一定不会直接给出 mid")
+    check(isinstance(e, str), "短链跟不动时给的是字符串说明，不是异常")
+
+    # 认不出来要给话，不能静默返回 None
+    mid, e = ugc.parse_mid("")
+    check(mid is None and e, "空输入给提示", e)
+    mid, e = ugc.parse_mid("某个UP主")
+    check(mid is None and "mid" in e, "认不出来的输入给提示", e[:40])
+    mid, e = ugc.parse_mid(None)
+    check(mid is None and e, "None 也不崩")
+
+    # 两种分组的归一
+    a = ugc._norm_meta({"season_id": 13794, "name": "合集名", "total": "67"}, "season")
+    check(a["kind"] == "season" and a["id"] == 13794, "合集归一取 season_id")
+    check(a["count"] == 67, "total 是字符串也能转成数字", a["count"])
+    b = ugc._norm_meta({"series_id": 2229877, "name": "系列名", "total": 10}, "series")
+    check(b["kind"] == "series" and b["id"] == 2229877, "系列归一取 series_id")
+
+    c = ugc._norm_meta({}, "season")
+    check(c["title"] == "未命名" and c["count"] == 0, "字段缺失时有兜底")
+    d = ugc._norm_meta({"season_id": 1, "name": "x", "total": "坏值"}, "season")
+    check(d["count"] == 0, "total 是垃圾值时按 0 处理", d["count"])
+
+
+# ============================================================================
+#  十四、合集：分节切分
+# ============================================================================
+def test_ugc_section():
+    group("测试组 14  合集分节切分")
+
+    import bili_ugc as ugc
+
+    vids = [{"bvid": "BV%d" % i} for i in range(1, 11)]
+    secs = [{"title": "前期", "count": 3},
+            {"title": "中期", "count": 4},
+            {"title": "后期", "count": 3}]
+
+    got, e = ugc.slice_section(vids, secs, 1)
+    check([v["bvid"] for v in got] == ["BV1", "BV2", "BV3"], "第 1 节", e or "")
+    got, e = ugc.slice_section(vids, secs, 2)
+    check([v["bvid"] for v in got] == ["BV4", "BV5", "BV6", "BV7"],
+          "第 2 节的起点不是固定的 3，而是前面各节之和", e or "")
+    got, e = ugc.slice_section(vids, secs, 3)
+    check([v["bvid"] for v in got] == ["BV8", "BV9", "BV10"], "第 3 节", e or "")
+
+    # 越界必须报错。静默返回空的话，用户会以为"这一节是空的"
+    for n in (0, 4, 99, -1):
+        got, e = ugc.slice_section(vids, secs, n)
+        check(not got and e, "第 %s 节越界时报错" % n, e)
+    got, e = ugc.slice_section(vids, secs, "x")
+    check(not got and "数字" in e, "分节号不是数字时给出说明", e)
+
+    got, e = ugc.slice_section(vids, [], 1)
+    check(not got and e, "没有分节信息时报错", e)
+
+    # 分节声称的集数比实际多时，切片不能越界崩掉
+    got, e = ugc.slice_section(vids, [{"count": 99}], 1)
+    check(len(got) == 10, "分节集数虚高时按实际条数截断", len(got))
+
+    # 单分节等价于全部
+    one = [{"count": 10}]
+    got, e = ugc.slice_section(vids, one, 1)
+    check(len(got) == 10, "只有一个分节时切出来就是全部")
+
+
+# ============================================================================
+#  十五、合集：网页接口的裁剪与校验
+# ============================================================================
+def test_ugc_norm():
+    group("测试组 15  网页响应的字段裁剪")
+
+    import web_app as web
+
+    v = web._video_brief({"bvid": "BV1x", "title": "标题", "duration": 12,
+                          "parts": 3, "stat": {"view": 1}, "cover": "http://x",
+                          "intro": "很长很长的简介"})
+    for k in ("bvid", "title", "duration", "parts", "up"):
+        check(k in v, "_video_brief 有 %s" % k)
+    check("stat" not in v, "播放量这类字段被裁掉（响应会小好几倍）")
+    check("cover" not in v, "封面字段被裁掉")
+    check("intro" not in v, "简介被裁掉")
+    check(v["parts"] == 3, "分P 数保留")
+
+    # 字段缺失不能崩
+    v2 = web._video_brief({})
+    check(v2["bvid"] == "" and v2["parts"] == 1, "空缺字段有兜底", v2)
+
+    c = web._collection_brief({"kind": "season", "id": 1, "mid": 2,
+                               "title": "T", "count": 3,
+                               "sections": [{"title": "s", "count": 3}]})
+    check(c["kind"] == "season" and c["sections"], "合集信息带分节")
+    c2 = web._collection_brief({})
+    check(c2["kind"] == "season" and c2["count"] == 0, "合集信息有兜底", c2)
+
+
+def test_ugc_web():
+    group("测试组 16  网页合集接口的路由与参数")
+
+    import web_app as web
+
+    # 路由表里要有这三个
+    src = open(os.path.join(HERE, "web_app.py"), encoding="utf-8").read()
+    for p in ('"/api/ugc/resolve"', '"/api/ugc/videos"', '"/api/batch/download"'):
+        check(p in src, "路由里有 %s" % p)
+
+    # 批量下载和收藏夹共用同一个实现，别再抄一份
+    check("path == \"/api/batch/download\":\n            self._fav_download()" in src
+          or '"/api/batch/download":' in src,
+          "两个批量地址指向同一处实现")
+
+    # 页面元素
+    page = web.page_html()
+    for eid in ("src", "srcfav", "srcugc", "ugcsrc", "colwrap", "colsel"):
+        check(('id="%s"' % eid) in page, "页面里有 #%s" % eid)
+    for fn in ("function switchSrc(", "function loadUgc(",
+               "function loadUgcVideos(", "function clearList("):
+        check(fn in page, "页面里有 %s" % fn)
+
+    # 换来源必须清列表，否则会剩下上一个来源的内容
+    check("clearList()" in page, "切换来源时有清列表的调用")
+    check("esc(c.title)" in page, "合集名过了 esc()")
+    check("esc(name)" in page, "列表标题里的合集名也过了 esc()")
+
+
+# ============================================================================
+#  十七、变量名遮蔽
+# ============================================================================
+def test_shadowing():
+    group("测试组 17  没有变量名遮蔽输出函数")
+
+    # 这条是补历史账：v1.2 的 try_dash 里有个参数叫 info，
+    # 把模块级的 info() 盖掉了，7 个调用点会抛
+    # TypeError: 'dict' object is not callable。
+    # 这种错只在真跑到那一行才炸，所以用静态检查兜住
+    import ast
+
+    names = ("info", "warn", "err", "step", "ok")
+    for f in ("bili_dl.py", "bili_fav.py", "bili_ugc.py"):
+        src = open(os.path.join(HERE, f), encoding="utf-8").read()
+        tree = ast.parse(src)
+        bad = []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            for a in list(fn.args.args) + list(fn.args.kwonlyargs):
+                if a.arg in names:
+                    bad.append("%s(): 参数叫 %s（第 %d 行）"
+                               % (fn.name, a.arg, fn.lineno))
+            for sub in ast.walk(fn):
+                if isinstance(sub, ast.Assign):
+                    for tg in sub.targets:
+                        if isinstance(tg, ast.Name) and tg.id in names:
+                            bad.append("%s(): 赋值给 %s（第 %d 行）"
+                                       % (fn.name, tg.id, sub.lineno))
+        check(not bad, "%s 没有遮蔽输出函数" % f, "; ".join(bad[:4]))
+
+    # 合集模块里那个专门躲开的参数名，别被改回去
+    ugc = open(os.path.join(HERE, "bili_ugc.py"), encoding="utf-8").read()
+    check("def show_sections(cinfo, videos)" in ugc,
+          "show_sections 的参数叫 cinfo 而不是 info")
+    check("def _mention_season(vinfo)" in open(
+        os.path.join(HERE, "bili_dl.py"), encoding="utf-8").read(),
+        "_mention_season 的参数叫 vinfo")
+
+
 def main():
     print("=" * 72)
-    print("收藏夹 / 模板 / 附加内容  离线测试")
+    print("收藏夹 / 合集 / 模板 / 附加内容  离线测试")
     print("=" * 72)
 
     for fn in (test_template, test_config, test_parts, test_selection,
                test_dead, test_interactive, test_quiet, test_web_opts,
-               test_batch_state, test_server, test_sidecar, test_concurrency):
+               test_batch_state, test_server, test_sidecar, test_concurrency,
+               test_ugc_mid, test_ugc_section, test_ugc_norm,
+               test_ugc_web, test_shadowing):
         try:
             fn()
         except Exception as e:

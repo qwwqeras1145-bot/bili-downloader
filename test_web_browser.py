@@ -370,7 +370,100 @@ def main():
                       "批量面板列出的条数与选中数一致")
 
         print()
-        print("七、页面无 JS 报错")
+        print("七、合集：从视频链接找到合集并批量下载")
+        print("=" * 72)
+        check(cdp.js("!!document.getElementById('src')"), "来源下拉框存在")
+        check(cdp.js("!!document.getElementById('ugcsrc')"), "合集输入框存在")
+        check(cdp.js("document.getElementById('colwrap').style.display") == "none",
+              "一开始合集下拉是收起的")
+
+        # 切到「UP 的合集」：收藏夹那栏应收起，合集输入框应出现
+        cdp.js("var s=document.getElementById('src');s.value='ugc';s.onchange()")
+        check(cdp.js("document.getElementById('srcugc').style.display") != "none",
+              "切到合集后输入框显示出来")
+        check(cdp.js("document.getElementById('srcfav').style.display") == "none",
+              "切到合集后收藏夹那栏收起")
+
+        # 贴一个在合集里的视频链接。这条路应该一步到位列出全集
+        cdp.js("document.getElementById('ugcsrc').value='BV1kv4y1L7EC'")
+        cdp.js("document.getElementById('fload').click()")
+        ucnt = 0
+        for _ in range(60):
+            time.sleep(1)
+            ucnt = cdp.js("document.querySelectorAll('#favlist .fav').length") or 0
+            if ucnt > 0:
+                break
+        check(ucnt > 1, "从视频链接直接列出合集里的 %s 个视频" % ucnt,
+              cdp.js("document.getElementById('favstate').textContent"))
+
+        if ucnt > 0:
+            state = cdp.js("document.getElementById('favstate').textContent") or ""
+            check("梦轩" in state or "合集" in state,
+                  "界面上说明了这是哪个合集: %s" % state.strip()[:40])
+            check(cdp.js("document.querySelectorAll('#favlist .fav .dl').length") == ucnt,
+                  "每一行都有单独下载按钮")
+
+            # 只下第 2 个（挑单个）。用下标直接触发，等价于点那一行的「下载」
+            cdp.js("document.querySelectorAll('#favlist .fav')[1].querySelector('.dl').click()")
+            bt2 = ""
+            for _ in range(90):
+                time.sleep(1)
+                bt2 = cdp.js("document.getElementById('btbox').textContent") or ""
+                if "全部结束" in bt2:
+                    break
+            check("全部结束" in bt2, "单独下载合集里的一个视频，批量面板跑到结束")
+            check(cdp.js("document.querySelectorAll('#btbox .it').length") == 1,
+                  "只提交了 1 个任务")
+            # 面板上要显示合集名，而不是一个笼统的"合集"
+            check("梦轩" in bt2, "批量面板上显示了合集名: %s" % " ".join(bt2.split())[:50])
+            if bt2:
+                print("      面板: %s" % " ".join(bt2.split())[:100])
+
+        # 贴 UP 的 mid：应列出全部合集，且不直接开工
+        cdp.js("document.getElementById('ugcsrc').value='517327498'")
+        cdp.js("document.getElementById('fload').click()")
+        ncol = 0
+        for _ in range(40):
+            time.sleep(0.5)
+            ncol = cdp.js("document.getElementById('colsel').options.length") or 0
+            if ncol > 1:
+                break
+        check(ncol > 1, "贴 UP mid 后列出 %s 个合集或系列" % ncol)
+        check(cdp.js("document.getElementById('colwrap').style.display") != "none",
+              "合集下拉框已展开")
+        check(cdp.js("document.querySelectorAll('#favlist .fav').length") == 0,
+              "列合集时不会先把某个合集的内容倒出来")
+
+        # 选一个系列（罗翔的"直播回放"是系列，走的是另一套接口）
+        idx = cdp.js(
+            "(function(){var s=document.getElementById('colsel');"
+            "for(var i=0;i<s.options.length;i++){"
+            "if(s.options[i].textContent.indexOf('[系列]')===0){s.selectedIndex=i;"
+            "s.onchange();return i}}return -1})()")
+        print("      选中的系列下标: %s" % idx)
+        scnt = 0
+        for _ in range(60):
+            time.sleep(1)
+            scnt = cdp.js("document.querySelectorAll('#favlist .fav').length") or 0
+            if scnt > 0:
+                break
+        check(scnt > 0, "系列里的视频也列得出来（%s 个）" % scnt,
+              cdp.js("document.getElementById('favstate').textContent"))
+        # 系列里的视频不该有"共几P"角标（合集接口不返回分P 数）
+        check(cdp.js("document.getElementById('favstate').textContent.indexOf('系列')>=0"
+                     "||document.querySelectorAll('#favlist .fav').length>0"),
+              "系列列表渲染正常")
+
+        # 换回收藏夹来源，列表必须清干净（否则会出现"来源写着收藏夹、
+        # 列表里却是合集的视频"这种对不上的状态）
+        cdp.js("var s=document.getElementById('src');s.value='fav';s.onchange()")
+        check(cdp.js("document.querySelectorAll('#favlist .fav').length") == 0,
+              "切回收藏夹来源后会清空上一次的列表")
+        check(cdp.js("document.getElementById('colwrap').style.display") == "none",
+              "切回收藏夹后合集下拉收起")
+
+        print()
+        print("八、页面无 JS 报错")
         print("=" * 72)
         errs = cdp.js("JSON.stringify(window.__errs||[])") or "[]"
         check(errs == "[]", "整个流程没有 JS 报错或未处理的 Promise 拒绝", errs[:200])

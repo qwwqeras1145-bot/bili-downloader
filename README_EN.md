@@ -2,8 +2,9 @@
 
 Paste a link and download the video. Two versions — CLI and web — with QR-code login
 and automatic selection of the highest available quality.
-Download a whole favorites folder (all of it, or hand-picked items), and pull in
-subtitles, danmaku (bullet comments), cover art and video metadata along the way.
+Download a whole favorites folder or a whole UP collection (all of it, or hand-picked
+items), and pull in subtitles, danmaku (bullet comments), cover art and video metadata
+along the way.
 
 **Only needs `requests`. No ffmpeg, no GUI libraries, and no Flask.**
 
@@ -18,7 +19,7 @@ The QR code is drawn directly in your terminal or on the web page — scan it wi
 | Version | Entry point | Best for |
 |---|---|---|
 | CLI | `python bili_dl.py` | Batch downloads, scripting, remote terminals |
-| Web | `python web_app.py` | Wanting a UI, scrubbing the video to preview, picking videos out of a favorites folder |
+| Web | `python web_app.py` | Wanting a UI, scrubbing the video to preview, picking videos out of a favorites folder or a collection |
 
 The web version opens your browser automatically — paste a link in the UI and click.
 
@@ -195,6 +196,67 @@ responses bleeding into one another.
 **Multi-part videos download only part 1 by default.** Add `--all-parts` to download
 every part.
 
+### Collections and series
+
+Favorites folders answer "what did I save"; collections answer "an UP grouped a batch of
+videos together". Collections are public, so **no login is needed**.
+
+The handiest way in is to just paste a video link — the tool follows that video to the
+collection it belongs to:
+
+```bash
+# See which collection this video belongs to, and what's inside it
+python bili_dl.py --season BV1xx411c7mD
+
+# Download the whole collection
+python bili_dl.py --season BV1xx411c7mD --all
+
+# Pick specific ones
+python bili_dl.py --season BV1xx411c7mD --pick 1,3,5-9
+
+# Only the 2nd section (a collection can be split into sections, like "early" / "mid" / "late")
+python bili_dl.py --season BV1xx411c7mD --section 2
+
+# Filter by title keyword
+python bili_dl.py --season BV1xx411c7mD --search tutorial --all
+```
+
+You can also start from the UP and list every collection and series they have:
+
+```bash
+# Interactive: paste a video link or the UP's mid and pick step by step
+python bili_dl.py --season
+
+# List one UP's collections and series
+python bili_dl.py --up 517327498
+python bili_dl.py --up https://space.bilibili.com/517327498
+
+# What's inside a given collection or series
+python bili_dl.py --up 517327498 --season-id 3993361 --all
+python bili_dl.py --up 517327498 --series-id 2229877 --pick 1-3
+```
+
+`--all` `--pick` `--search` `--list-only` work exactly the same way as they do for
+favorites folders.
+When you download a video that belongs to a collection, the tool mentions in passing how
+many episodes that collection has.
+
+**A collection and a series are two different things** — different endpoints, different
+fields — but to the user they are the same thing:
+
+| | Collection (season) | Series (series) |
+|---|---|---|
+| Can it have sections | Yes, and a section can hold several episodes | No |
+| Typical case | A serialized tutorial, a serialized anime | Livestream replays, a grouping around one topic |
+| Paging parameters | `page_num` / `page_size` | `pn` / `ps` |
+
+The tool calls whichever endpoint applies on its own, and every entry `--up` lists is
+tagged `[collection]` or `[series]`.
+
+One thing to watch when using `--season-id` / `--series-id`: **those two IDs must be used
+together with `--up <mid>`**, because the endpoints require the mid and the ID at the same
+time. An ID on its own gets you nothing.
+
 ### Naming templates
 
 The default name is `{title}.mp4`. To organize things into directories, use `-t`:
@@ -316,11 +378,15 @@ the link to save the file.
 - **Scrubbable preview**: the file server implements Range requests, so the browser can
   play and seek directly
 - QR login inside the page, with the QR code drawn on the page itself
-- **Account favorites folders**: pick a folder to load its video list, tick several for a
-  batch download, or click "download" on a single row to grab just that one
+- **Favorites folders / collections**: the source can be switched.
+  Pick "account favorites" to list the logged-in account's folders;
+  pick "UP collections" and paste a video link to find the collection it belongs to,
+  or paste the UP's mid / space link to list all of that UP's collections and series.
+  Once a video list is loaded you can tick several for a batch download, or click
+  "download" on a single row to grab just that one
 - **Extras options**: subtitles, danmaku, cover, metadata, audio-only, download all
   parts — all of these, together with the naming template above, apply to both single
-  downloads and favorites batches
+  downloads and batch downloads
 - Batch progress panel: each video's percentage, done or failed at a glance, and finished
   ones have a clickable "save"
 
@@ -330,7 +396,7 @@ the link to save the file.
 python web_app.py --port 9000        # different port, default is 8848
 python web_app.py --out D:\videos    # output directory
 python web_app.py --no-browser       # don't open a browser
-python web_app.py --jobs 4           # concurrency for favorites batches, defaults to config, capped at 4
+python web_app.py --jobs 4           # concurrency for batches, defaults to config, capped at 4
 ```
 
 If the port is taken it automatically tries the next ones instead of failing outright.
@@ -417,6 +483,7 @@ doesn't fail — it keeps both files and tells you how to load them separately i
 - **Automatic quality**   after login, picks the highest tier your account is allowed
 - **Skip existing**   a file that's already downloaded is skipped
 - **Favorites downloads**   download a whole folder, or filter by index, keyword or size and pick
+- **Collections and series**   paste a video link to find the collection it belongs to and download the whole set; you can also list all of a UP's collections
 - **Extras**   subtitles, danmaku (with ASS conversion), cover art, video metadata
 - **Audio only**   grab the audio track directly instead of wasting bandwidth on video
 - **Naming templates**   organize into directories automatically by uploader, date, quality and more
@@ -429,14 +496,14 @@ doesn't fail — it keeps both files and tells you how to load them separately i
 ```bash
 python test_bili.py              # CLI main suite, 216 checks, offline
 python test_bili.py --online     # also verifies the live API
-python test_fav.py               # favorites, templates, extras, config, 199 checks, offline
+python test_fav.py               # favorites, collections, templates, extras, config, 262 checks, offline
 python test_shutdown.py          # stopping the service doesn't wait for in-flight requests
 python test_stability.py         # stability fuzzing, hunts specifically for crashes
 python test_e2e_stability.py     # end-to-end, includes a real resume test
 python test_qr.py                # QR encoder, cross-verified with an independent decoder
 python test_web.py               # web version API tests, 74 checks offline
-python test_web.py --online      # web version live end-to-end, 90 checks
-python test_web_browser.py       # drives the real UI in a real browser, 35 checks
+python test_web.py --online      # web version live end-to-end, 107 checks
+python test_web_browser.py       # drives the real UI in a real browser, 53 checks
 ```
 
 ### CLI
@@ -454,7 +521,7 @@ python test_web_browser.py       # drives the real UI in a real browser, 35 chec
 | 9 | Quality selection — premium-membership scenarios, silent downgrade, DASH track picking |
 | 10 | Argument precedence and defaults |
 
-### Favorites and extras
+### Favorites, collections and extras
 
 | Group | Coverage |
 |---|---|
@@ -470,6 +537,11 @@ python test_web_browser.py       # drives the real UI in a real browser, 35 chec
 | 10 | Page elements, placeholders, required JS functions, title escaping |
 | 11 | Subtitle-to-SRT and danmaku-to-ASS, including dirty data and advanced-danmaku skipping |
 | 12 | Concurrency isolation: per-job sessions, restoring the interactivity switch |
+| 13 | Collection entry parsing: mid, space link, video link, and the hint when it can't tell |
+| 14 | Collection section slicing: the three sections' boundaries don't start at a fixed value, out of range must raise |
+| 15 | Trimming fields out of the web response, so play counts and the like aren't handed to the frontend |
+| 16 | Collection routing and page elements, clearing the list on source switch, collection name escaping |
+| 17 | Variable shadowing check (output functions like `info` must not be covered by a parameter) |
 
 ### Web version
 
@@ -483,6 +555,8 @@ python test_web_browser.py       # drives the real UI in a real browser, 35 chec
 | 6 | Job management: ID generation, progress math, divide-by-zero, count cap |
 | 7 | Helper functions and byte counting |
 | 8 | CLI entry point, including automatic port fallback when the port is taken |
+| 9 | Live end-to-end: the QR endpoint, a real download, fetching it back with Range and checking it |
+| 10 | Collections and series (online): list a UP's collections, fetch collection videos, fetch series videos, find a collection from a video |
 
 The web version's file-serving tests work by **injecting fake jobs**, so they run fully
 offline and are repeatable, unaffected by how BiliBili's API happens to behave.
@@ -491,12 +565,15 @@ offline and are repeatable, unaffected by how BiliBili's API happens to behave.
 
 `test_web_browser.py` launches a real Edge (headless) and drives the page over CDP:
 fills in a link, clicks the button, waits for the download, reads the on-screen text, then
-loads a favorites folder, selects all, batch-downloads, and finally checks whether the
-batch panel ran to completion.
+loads a favorites folder, selects all, batch-downloads; then switches to the collection
+source, pastes a video link to find its collection, downloads one of them on its own,
+pastes the UP mid to list the collections, picks a series to load, and finally switches
+back to favorites to confirm the list was cleared.
 
 It verifies **the things API tests can't reach** — whether the click handler is actually
 bound, whether the progress bar really moves, whether the number on the button is right
-after select-all, whether the save link appears when it's done.
+after select-all, whether the save link appears when it's done, whether switching the
+source clears what the previous step left behind.
 
 ```
 python -m pip install websockets     # only needed to run this test
@@ -555,11 +632,21 @@ decoder can actually read counts as correct.
   private, region restrictions and similar cases will all fail.
 - **The subtitle endpoint is flaky.** The same video needs several requests before
   subtitles appear; the tool has retries built in.
-- **A favorites batch accepts at most 500 videos at a time** (web version). For more,
+- **A batch accepts at most 500 videos at a time** (web version batches). For more,
   split it into batches or use the CLI.
 - **Multi-part videos download only part 1 by default**; getting them all requires
-  explicitly turning the switch on. The favorites API only gives you the *total* number of
-  parts, not *which* part an entry is, so there's no way to pick part by part in a batch.
+  explicitly turning the switch on. The favorites API gives you the *total* number of
+  parts, the collection API doesn't (always counted as 1), and neither API gives you
+  *which* part an entry is, so there's no way to pick part by part in a batch.
+- **Collection sections are only recognized when you come in from a video link.** The
+  `ugc_season` endpoint carries the section structure, `seasons_archives_list` doesn't
+  (measured: its `meta` only has
+  `category/cover/description/mid/name/ptime/season_id/title/total`).
+  When you specify with `--season-id`, the tool makes one extra request to get the
+  sections, and if the first episode has been moved out of the collection so they don't
+  line up, it tells you explicitly to use `--pick` instead.
+- **Channels (`频道`) and playlists (`播放列表`) are not supported.** Those are a
+  different structure on the UP's homepage, with different endpoints.
 - The endpoints are BiliBili's public web APIs. If they change in the future, the tool
   will need updating accordingly.
 
@@ -620,6 +707,25 @@ something like "已失效视频" (video no longer available). Without filtering 
 early, a download would waste a request and then report failure — and across a batch of
 several hundred that adds up to a pile of fake failures.
 
+**What's the difference between a "collection" and a "series"?**
+
+Both are an UP grouping a batch of videos together, but the underlying endpoints differ:
+
+- **Collections** can be split into sections (like "early" / "mid" / "late"); a
+  serialized tutorial is usually a collection
+- **Series** have no sections; livestream replays and groupings around one topic are
+  usually series
+
+The tool calls whichever endpoint applies on its own, and when `--up` lists them every
+entry is tagged `[collection]` or `[series]`, so you don't have to tell them apart
+yourself.
+
+**Why does `--season-id` have to be paired with `--up <mid>`?**
+
+The endpoints require the mid and the ID at the same time; give only an ID and nothing
+comes back. The `--season` path (pasting a video link) doesn't need the mid by hand —
+the tool reads it out of the video info.
+
 **I ticked subtitles but got no `.srt`?**
 
 BiliBili's subtitle endpoint is unstable; the same video needs several requests before
@@ -649,6 +755,49 @@ use. Normal personal-viewing volume is fine.
 ---
 
 ## Changelog
+
+### v1.4
+
+Collection and series downloads, filled in on both the CLI and the web version at once.
+
+New
+
+- **UP collection and series downloads** (`bili_dl.py --season` / `--up`). The handiest
+  way in is pasting a video link: the tool follows that video to the collection it belongs
+  to and gets the whole set in one request. You can also list all of a UP's collections and
+  series, then specify one by ID and download it in a batch or pick items out of it
+- **Collection sections**: `--section 2` downloads only the 2nd section. A collection can
+  be split into several sections, like "early / mid / late"
+- **A new "UP collections" source in the web version**: it shares one list and checkbox
+  mechanism with favorites, and the source can be switched. Pasting a video link gets you
+  there in one step; pasting a mid lists every collection and you pick
+- When downloading a video that belongs to a collection, the tool mentions in passing how
+  many episodes it has and how to grab the whole set
+- Added `bili_ugc.py`; `test_fav.py` gained 5 groups (13-17),
+  `test_web.py --online` gained a live collections group, and `test_web_browser.py` gained
+  a collections UI group
+
+Two places that are easy to get wrong — both are written into the comments
+
+- **The collection API and the series API use different field names.** The paging
+  parameter is `page_num`/`page_size` for one and `pn`/`ps` for the other; the ID is called
+  `season_id` for one and `series_id` for the other. Each gets its own fetch function, but
+  both normalize into the same structure before being handed upwards
+- **Only `ugc_season` has the section information.** `seasons_archives_list`'s `meta` has
+  no sections (measured: only category/cover/description/mid/name/ptime/season_id/
+  title/total). So `--section` on the "coming in from `--season-id`" path has to make one
+  extra request, looking it up with any one episode from the collection
+
+Also fixed along the way
+
+- **`show_sections(info, ...)` covered the module-level `info()` output function**, and
+  the line that called it raised `TypeError: 'dict' object is not callable`.
+  The parameter is renamed to `cinfo`. This is a repeat of the same-name problem from
+  v1.2, so this time a static check was added (test group 17) to block this whole class of
+  shadowing
+- The web version didn't clear the previous step's list when switching sources, which
+  produced mismatched states like "the source says favorites but the list holds collection
+  videos"
 
 ### v1.3
 

@@ -11,6 +11,16 @@ r"""
    python bili_dl.py <链接> --all        下载全部分P
    python bili_dl.py <链接> -q 120       指定清晰度（120 是 4K）
    python bili_dl.py --fav               浏览并下载收藏夹（批量或单个）
+   python bili_dl.py --season            浏览并下载 UP 的合集/系列
+   python bili_dl.py --up <mid>          列出某个 UP 的全部合集与系列
+
+ 合集与系列
+   --season <视频链接>           找出这个视频所属的合集
+   python bili_dl.py --season <视频链接> --all        下整个合集
+   python bili_dl.py --season <视频链接> --pick 1,3-5 挑着下
+   python bili_dl.py --season <视频链接> --section 2  只要第 2 个分节
+   python bili_dl.py --up <mid> --season-id 13794 --all
+   python bili_dl.py --up <mid> --series-id 2229877 --all
 
  附加内容（可单独开，也可用 --all-extras 一次全开）
    --subtitle        下字幕，存成 SRT
@@ -73,7 +83,7 @@ except ImportError:
 
 
 APP_NAME = "Fairy III 型 · B 站视频下载器"
-APP_VER = "1.3"
+APP_VER = "1.4"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -2849,7 +2859,33 @@ def download_one(bili, link, page=None, outdir=None, qn=None, all_parts=False,
             err("下载未完成")
             all_ok = False
 
+    # 这个视频如果在某个合集里，顺口提一句能整套下。
+    # ugc_season 就在上面那次 video_info 的返回里，不额外花请求
+    _mention_season(data)
+
     return all_ok
+
+
+def _mention_season(vinfo):
+    """
+    如果视频属于某个合集，提示可以整套下载。
+
+    只提示不打扰：只在真有人看着终端时输出（静默模式下 info 自动静默），
+    所以批量下载时不会每个视频都刷一行。
+    """
+    try:
+        us = (vinfo or {}).get("ugc_season")
+        if not us:
+            return
+        n = sum(len(s.get("episodes") or []) for s in (us.get("sections") or []))
+        title = us.get("title") or "某个合集"
+        if n <= 1:
+            return
+        info("这个视频属于合集「%s」（共 %d 集）。" % (title, n))
+        info("下整套： python bili_dl.py --season <这个视频的链接> --all")
+    except Exception:
+        # 提示而已，任何意外都不该影响已经下载成功的结果
+        pass
 
 
 def _save_sidecar_quiet(bili, vinfo, page, base_path, opts):
@@ -3049,6 +3085,17 @@ def main():
         print(BANNER)
         print(NOTICE)
         return bili_fav.main(bili, cfg, argv[1:])
+
+    if cmd in ("--season", "--up"):
+        # 合集与系列。和 --fav 一样单独一个模块
+        try:
+            import bili_ugc
+        except ImportError:
+            err("找不到 bili_ugc.py，它应该和 bili_dl.py 放在同一目录")
+            return 2
+        print(BANNER)
+        print(NOTICE)
+        return bili_ugc.main(bili, cfg, argv[1:])
 
     # 下载模式
     if cmd in ("-o", "--out"):

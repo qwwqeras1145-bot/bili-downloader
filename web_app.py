@@ -82,7 +82,7 @@ except ImportError:
 APP_TITLE = "B站视频下载器 · 网页版"
 # 和命令行版同一个版本号：两个版本一起发布，共用同一套下载逻辑和测试，
 # 各自编号只会让人分不清哪个是哪个
-APP_VER = "1.3"
+APP_VER = "1.4"
 
 MAX_JOBS = 50               # 内存里最多保留多少个历史任务
 JOB_TTL = 6 * 3600          # 任务记录保留多久（秒）
@@ -579,17 +579,36 @@ def page_html():
   </div>
 
   <div class="card">
-    <label style="margin-bottom:10px">账号收藏夹</label>
+    <label style="margin-bottom:10px">收藏夹 / 合集</label>
     <div class="favbar">
-      <div>
-        <label>选择收藏夹</label>
-        <select id="folder"><option value="">— 先登录，再点「载入收藏夹」 —</option></select>
+      <div style="flex:0 0 140px">
+        <label>来源</label>
+        <select id="src">
+          <option value="fav">账号收藏夹</option>
+          <option value="ugc">UP 的合集</option>
+        </select>
       </div>
-      <div><button id="fload">载入收藏夹</button></div>
+      <div id="srcfav">
+        <label>选择收藏夹</label>
+        <select id="folder"><option value="">— 点「载入」开始 —</option></select>
+      </div>
+      <div id="srcugc" style="display:none">
+        <label>视频链接，或 UP 的 mid / 空间链接</label>
+        <input type="text" id="ugcsrc" autocomplete="off"
+               placeholder="粘贴视频链接可找出它所属的合集；贴 mid 则列出该 UP 的全部合集">
+      </div>
+      <div><button id="fload">载入</button></div>
       <div><button id="fdl">下载选中</button></div>
     </div>
+
+    <div id="colwrap" style="display:none">
+      <label style="margin-top:12px">选择合集或系列</label>
+      <select id="colsel"></select>
+    </div>
+
     <div class="hint" id="favstate">
-      需要先扫码登录。载入后可以勾选单个视频单独下载，也可以全选后一次性批量下载。
+      收藏夹需要先扫码登录。合集是公开的，不需要登录。
+      载入后可以勾选多个批量下载，也可以点某一行的「下载」只下那一个。
       附加选项与上面那张卡片共用。
     </div>
     <div class="favlist" id="favlist"></div>
@@ -815,11 +834,35 @@ $('login').onclick = async () => {
   }, 1500);
 };
 
-// ===================== 收藏夹 =====================
+// ===================== 收藏夹 / 合集 =====================
 let favFolders = [], favVideos = [], favLimit = 300, btTimer = null, btId = null;
+let ugcCollections = [], ugcMid = null;
 
 function pickedCount(){
   return document.querySelectorAll('#favlist .ck:checked').length;
+}
+
+// 换来源时要把上一步的结果清干净，否则会出现
+// "列表里是收藏夹的视频，但来源写着合集"这种对不上的状态
+function clearList(){
+  favVideos = [];
+  $('favlist').innerHTML = '';
+  $('favacts').style.display = 'none';
+  $('fdl').textContent = '下载选中';
+  $('fdl').className = '';
+}
+
+function switchSrc(){
+  const ugc = $('src').value === 'ugc';
+  $('srcfav').style.display = ugc ? 'none' : '';
+  $('srcugc').style.display = ugc ? '' : 'none';
+  $('colwrap').style.display = 'none';
+  ugcCollections = [];
+  clearList();
+  $('favstate').textContent = ugc
+    ? '合集是公开的，不需要登录。粘贴一个视频链接，可以找出它所属的合集；'
+      + '或者贴 UP 的 mid / 空间链接，列出这个 UP 的全部合集与系列。'
+    : '收藏夹需要先扫码登录。选一本收藏夹，点「载入」。';
 }
 
 function loadFolders(){
@@ -842,27 +885,95 @@ function loadFolders(){
 
 function loadVideos(limit){
   const id = $('folder').value;
-  if(!id){ $('favstate').textContent = '先点「载入收藏夹」，或从下拉框里选一个。'; return; }
+  if(!id){ $('favstate').textContent = '先点「载入」，或从下拉框里选一个。'; return; }
   $('fload').disabled = true;
   $('fdl').disabled = true;
   $('favstate').textContent = '正在读取，收藏夹大的话要翻很多页…';
   return jget('/api/fav/videos?id=' + encodeURIComponent(id) + '&limit=' + limit)
     .then(d => {
       if(d.error){ $('favstate').textContent = d.error; return; }
-      favVideos = d.videos || [];
+      favVideos = (d.videos || []).map(v => ({
+        bvid: v.bvid, title: v.title, parts: v.parts || 1
+      }));
       favLimit = limit;
-      renderFavs();
+      renderFavs(d.total || 0);
     })
     .catch(e => { $('favstate').textContent = '读取失败：' + e; })
     .then(() => { $('fload').disabled = false; $('fdl').disabled = false; });
 }
 
-function renderFavs(){
+// 合集：先看输入的是视频还是 UP，再决定是直接列视频还是让用户挑一个合集
+async function loadUgc(){
+  const q = $('ugcsrc').value.trim();
+  if(!q){ $('favstate').textContent = '请粘贴视频链接，或 UP 的 mid / 空间链接。'; return; }
+
+  $('fload').disabled = true;
+  $('favstate').textContent = '正在查…';
+  let d;
+  try{
+    d = await jget('/api/ugc/resolve?q=' + encodeURIComponent(q));
+  }catch(e){
+    $('favstate').textContent = '请求失败：' + e;
+    $('fload').disabled = false;
+    return;
+  }
+  if(d.error){ $('favstate').textContent = d.error; $('fload').disabled = false; return; }
+
+  // 视频在合集里 —— 一步到位，直接列出来
+  if(d.videos){
+    ugcCollections = d.collection ? [d.collection] : [];
+    ugcMid = (d.collection && d.collection.mid) || null;
+    $('colwrap').style.display = 'none';
+    favVideos = d.videos;
+    renderFavs(0, d.collection ? d.collection.title : '');
+    $('fload').disabled = false;
+    return;
+  }
+
+  // 给的是 UP（或者视频不在合集里）—— 列出合集让用户挑
+  ugcMid = d.mid;
+  ugcCollections = d.collections || [];
+  if(!ugcCollections.length){
+    $('favstate').textContent = d.note || '这个 UP 没有公开的合集或系列。';
+    $('fload').disabled = false;
+    return;
+  }
+  $('colsel').innerHTML = ugcCollections.map((c, i) =>
+    '<option value="' + i + '">'
+    + (c.kind === 'season' ? '[合集] ' : '[系列] ')
+    + esc(c.title) + '（' + c.count + ' 集）</option>').join('');
+  $('colwrap').style.display = '';
+  $('favstate').textContent = '这个 UP 有 ' + ugcCollections.length
+    + ' 个合集或系列。选一个，再点「载入」。';
+  clearList();
+  $('fload').disabled = false;
+  $('fload').textContent = '载入所选合集';
+}
+
+function loadUgcVideos(){
+  const i = parseInt($('colsel').value, 10);
+  const c = ugcCollections[i];
+  if(!c || !ugcMid){ $('favstate').textContent = '先选一个合集。'; return; }
+  $('fload').disabled = true;
+  $('favstate').textContent = '正在读取「' + c.title + '」…';
+  jget('/api/ugc/videos?mid=' + encodeURIComponent(ugcMid)
+       + '&kind=' + encodeURIComponent(c.kind)
+       + '&id=' + encodeURIComponent(c.id) + '&limit=2000')
+    .then(d => {
+      if(d.error){ $('favstate').textContent = d.error; return; }
+      favVideos = d.videos || [];
+      renderFavs(0, c.title);
+    })
+    .catch(e => { $('favstate').textContent = '读取失败：' + e; })
+    .then(() => { $('fload').disabled = false; });
+}
+
+function renderFavs(total, name){
   const box = $('favlist');
   if(!favVideos.length){
     box.innerHTML = '';
     $('favacts').style.display = 'none';
-    $('favstate').textContent = '这个收藏夹是空的，或者里面的稿件都已失效。';
+    $('favstate').textContent = '这里没有可取的内容，或者里面的稿件都已失效。';
     return;
   }
   box.innerHTML = favVideos.map((v, i) => {
@@ -877,19 +988,21 @@ function renderFavs(){
   }).join('');
   $('favacts').style.display = 'flex';
 
-  const f = favFolders.find(x => String(x.id) === $('folder').value);
-  const total = f ? f.count : favVideos.length;
-  let s = '已载入 <b>' + favVideos.length + '</b> 个';
+  let s = (name ? '「' + esc(name) + '」' : '') +
+          '已载入 <b>' + favVideos.length + '</b> 个';
   if(total > favVideos.length){
-    s += '（该收藏夹共 ' + total + ' 个，<a href="#" id="morelink">继续载入更多</a>）';
-  } else {
+    s += '（共 ' + total + ' 个，<a href="#" id="morelink">继续载入更多</a>）';
+  } else if(favVideos.length) {
     s += '（全部）';
   }
   s += '。勾选后点「下载选中」批量下，或点某一行的「下载」只下那一个。';
   $('favstate').innerHTML = s;
 
   const ml = $('morelink');
-  if(ml) ml.onclick = e => { e.preventDefault(); loadVideos(Math.min(favLimit * 2, 2000)); };
+  if(ml) ml.onclick = e => {
+    e.preventDefault();
+    loadVideos(Math.min(favLimit * 2, 2000));
+  };
 }
 
 function syncPick(){
@@ -952,17 +1065,31 @@ function startFav(indexes){
   const titles = {}, parts = {};
   picks.forEach(v => { titles[v.bvid] = v.title; parts[v.bvid] = v.parts || 1; });
 
-  const f = favFolders.find(x => String(x.id) === $('folder').value);
+  // 批次名只用来在进度面板上显示，取当前来源里最能说明问题的那个
+  let name = '收藏夹';
+  if($('src').value === 'ugc'){
+    // 从视频链接一步进来时合集下拉是收起的，这时列表里只有那一个合集，
+    // 直接用下标 0；否则按用户在下拉里选的那一项取
+    const shown = $('colwrap').style.display !== 'none';
+    const c = shown
+      ? ugcCollections[parseInt($('colsel').value, 10)]
+      : ugcCollections[0];
+    name = (c && c.title) || '合集';
+  } else {
+    const f = favFolders.find(x => String(x.id) === $('folder').value);
+    if(f) name = f.title;
+  }
+
   const body = Object.assign({
     bvids: bvids, titles: titles, parts: parts,
-    name: f ? f.title : '收藏夹',
+    name: name,
     qn: $('qn').value || null
   }, getOpts());
 
   $('fdl').disabled = true;
   hideMsg();
 
-  fetch('/api/fav/download', {
+  fetch('/api/batch/download', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify(body)
@@ -1021,14 +1148,31 @@ function pollBatch(){
   }, 900);
 }
 
+$('src').onchange = switchSrc;
+
 $('fload').onclick = () => {
   hideMsg();
+  if($('src').value === 'ugc'){
+    // 已经列出合集且用户选好了，这次点击是"载入所选合集"
+    if(ugcCollections.length && $('colwrap').style.display !== 'none'){
+      loadUgcVideos();
+    } else {
+      $('fload').textContent = '载入';
+      loadUgc();
+    }
+    return;
+  }
+  $('fload').textContent = '载入';
   // 第一次点：没有收藏夹列表就先取列表，再读第一个收藏夹的内容
   const go = favFolders.length ? Promise.resolve(true) : loadFolders();
   go.then(ok => { if(ok) loadVideos(300); });
 };
 $('folder').onchange = () => { if(favFolders.length) loadVideos(300); };
+$('colsel').onchange = () => { if($('colwrap').style.display !== 'none') loadUgcVideos(); };
 $('fdl').onclick = () => startFav(null);
+$('ugcsrc').addEventListener('keydown', e => {
+  if(e.key === 'Enter') $('fload').click();
+});
 
 $('logout').onclick = async () => {
   await fetch('/api/logout', {method:'POST'});
@@ -1233,6 +1377,14 @@ class Handler(BaseHTTPRequestHandler):
             self._fav_videos()
             return
 
+        if path == "/api/ugc/resolve":
+            self._ugc_resolve()
+            return
+
+        if path == "/api/ugc/videos":
+            self._ugc_videos()
+            return
+
         if path == "/api/batch":
             q = parse_qs(urlparse(self.path).query)
             bid = (q.get("id") or [""])[0]
@@ -1273,7 +1425,142 @@ class Handler(BaseHTTPRequestHandler):
             self._fav_download()
             return
 
+        # 合集的批量下载和收藏夹走同一条路：请求体都只是一串 bvid，
+        # 服务端不需要知道这些编号是从收藏夹还是从合集里挑出来的。
+        # 保留两个地址只是让前端读起来清楚
+        if path == "/api/batch/download":
+            self._fav_download()
+            return
+
         self._json({"error": "not found"}, 404)
+
+    # ---- 合集与系列接口 ----
+    def _ugc_resolve(self):
+        """
+        看用户给的是"视频"还是"UP"，给出下一步需要的东西。
+
+        传视频链接时优先直接找出它所属的合集 —— 那是一条请求就能拿到全集的路，
+        比分两步（先查作者、再列合集、再选）快得多，也是用户最常用的一步。
+
+        两种可能的返回
+          {"collection": {...}, "videos": [...]}     视频在合集里，直接可以下
+          {"mid": ..., "collections": [...]}         给出这个 UP 的全部合集，让用户挑
+          {"mid": ..., "collections": [], "note": ...}  这个 UP 没有合集
+        """
+        q = parse_qs(urlparse(self.path).query)
+        text = ((q.get("q") or [""])[0] or "").strip()
+        if not text:
+            self._json({"error": "请粘贴视频链接，或 UP 的 mid / 空间链接"})
+            return
+
+        try:
+            import bili_ugc
+        except ImportError:
+            self._json({"error": "缺少 bili_ugc.py"})
+            return
+
+        b = core.Bili()
+        try:
+            mid, e = bili_ugc.parse_mid(text)
+        except Exception as ex:
+            self._json({"error": "解析失败：%s" % ex})
+            return
+        if e:
+            self._json({"error": e})
+            return
+
+        if mid is None:
+            # 是视频链接。先试着直接从它找合集
+            try:
+                cinfo, videos, e2 = bili_ugc.season_of_video(b, text)
+            except Exception as ex:
+                self._json({"error": "查合集出错：%s" % ex})
+                return
+            if e2:
+                self._json({"error": e2})
+                return
+            if cinfo and videos:
+                self._json({
+                    "collection": _collection_brief(cinfo),
+                    "videos": [_video_brief(v) for v in videos[:1000]],
+                })
+                return
+            # 不在合集里，退一步列作者的合集
+            try:
+                mid, e2 = bili_ugc.mid_of_video(b, text)
+            except Exception as ex:
+                self._json({"error": "查作者出错：%s" % ex})
+                return
+            if e2:
+                self._json({"error": e2})
+                return
+
+        try:
+            items, e = bili_ugc.list_collections(b, mid)
+        except Exception as ex:
+            self._json({"error": "读取合集出错：%s" % ex})
+            return
+        if e:
+            self._json({"error": e})
+            return
+
+        out = {"mid": mid, "collections": [
+            {"kind": c["kind"], "id": c["id"], "title": c["title"],
+             "count": c["count"]} for c in items]}
+        if not items:
+            out["note"] = "这个 UP 没有公开的合集或系列。"
+        self._json(out)
+
+    def _ugc_videos(self):
+        """列出某个合集或系列里的视频"""
+        q = parse_qs(urlparse(self.path).query)
+        try:
+            mid = int((q.get("mid") or [""])[0])
+        except Exception:
+            self._json({"error": "mid 不对"})
+            return
+        kind = (q.get("kind") or ["season"])[0]
+        if kind not in ("season", "series"):
+            self._json({"error": "kind 只能是 season 或 series"})
+            return
+        try:
+            cid = int((q.get("id") or [""])[0])
+        except Exception:
+            self._json({"error": "合集 ID 不对"})
+            return
+        try:
+            limit = int((q.get("limit") or ["300"])[0])
+        except Exception:
+            limit = 300
+        limit = max(1, min(limit, 2000))
+
+        section = (q.get("section") or [""])[0]
+        try:
+            section = int(section) if section else None
+        except Exception:
+            section = None
+
+        try:
+            import bili_ugc
+        except ImportError:
+            self._json({"error": "缺少 bili_ugc.py"})
+            return
+
+        b = core.Bili()
+        try:
+            if kind == "season":
+                videos, e = bili_ugc.fetch_season(b, mid, cid, limit=limit,
+                                                  section=section)
+            else:
+                videos, e = bili_ugc.fetch_series(b, mid, cid, limit=limit)
+        except Exception as ex:
+            self._json({"error": "读取失败：%s" % ex})
+            return
+        if e:
+            self._json({"error": e})
+            return
+        self._json({"videos": [_video_brief(v) for v in videos],
+                    "count": len(videos)})
 
     # ---- 收藏夹接口 ----
     def _fav_folders(self):
@@ -1716,6 +2003,36 @@ MIME_MAP = {
 def guess_mime(name):
     return MIME_MAP.get(os.path.splitext(name)[1].lower(),
                         "application/octet-stream")
+
+
+def _video_brief(v):
+    """
+    把视频条目裁成前端需要的样子。
+
+    合集接口返回的每条里还有 stat（播放量那一堆）、cover 之类，
+    几十条加起来响应会大好几倍，而界面上只用得到标题、编号、分P 数。
+    这里只留用得上的字段
+    """
+    return {
+        "bvid": v.get("bvid") or "",
+        "title": v.get("title") or "",
+        "duration": v.get("duration") or 0,
+        "up": v.get("up") or "",
+        # 合集接口不给分P 数，永远是 1；收藏夹那边是真的分P 数
+        "parts": v.get("parts") or 1,
+    }
+
+
+def _collection_brief(c):
+    """合集信息裁成前端需要的字段"""
+    return {
+        "kind": c.get("kind") or "season",
+        "id": c.get("id"),
+        "mid": c.get("mid"),
+        "title": c.get("title") or "",
+        "count": c.get("count") or 0,
+        "sections": c.get("sections") or [],
+    }
 
 
 class Server(ThreadingHTTPServer):
